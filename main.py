@@ -1,3 +1,11 @@
+from fastapi import FastAPI
+import asyncio
+from google import genai
+from google.genai import types
+
+# --- রেন্ডার সার্ভারের জন্য অ্যাপ ইনিশিয়ালাইজেশন ---
+app = FastAPI()
+
 # --- 3. স্মার্ট এআই কল ---
 async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False):
     keys_to_try = []
