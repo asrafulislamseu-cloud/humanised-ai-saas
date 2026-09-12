@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-sqlalchemy
-pydantic
-python-dotenv
-google-genai
-python-multipart
+fastapi==0.110.0
+uvicorn==0.28.0
+sqlalchemy==2.0.28
+pydantic==2.6.4
+python-dotenv==1.0.1
+google-genai==0.3.0
+python-multipart==0.0.9
