@@ -5,7 +5,7 @@ import time
 import random
 import itertools
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie
 from typing import Optional, Dict
 from enum import Enum
 from dotenv import load_dotenv
@@ -167,13 +167,13 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     raise last_exception
 
-# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার ---
+# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার (অটো কুক সেটআপ সহ) ---
 class UserRegisterRequest(BaseModel):
     email: str
     user_api_key: str
 
 @app.post("/register-or-login")
-def register_or_login(data: UserRegisterRequest, db: Session = Depends(get_db)):
+def register_or_login(data: UserRegisterRequest, response: Response, db: Session = Depends(get_db)):
     if not data.user_api_key or not data.user_api_key.strip():
         raise HTTPException(status_code=400, detail="Please provide your Gemini API key.")
     
@@ -185,15 +185,25 @@ def register_or_login(data: UserRegisterRequest, db: Session = Depends(get_db)):
         user.user_api_key = data.user_api_key.strip()
     
     db.commit()
-    return {"status": "success", "message": "Successfully logged in with API key!"}
+    
+    # ব্রাউজারে অটো ইমেইল কুকি সেভ করে দেওয়া হলো, যাতে বারবার ইমেইল লিখতে না হয়
+    response.set_cookie(key="current_user_email", value=data.email, httponly=True)
+    
+    return {"status": "success", "message": "Successfully logged in and active session created!"}
 
 class UserProfileUpdate(BaseModel):
-    email: str
     professional_bio: Optional[str] = None
 
 @app.post("/update-profile")
-def update_user_profile(data: UserProfileUpdate, db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.email == data.email).first()
+def update_user_profile(
+    data: UserProfileUpdate, 
+    current_user_email: Optional[str] = Cookie(None), 
+    db: Session = Depends(get_db)
+):
+    if not current_user_email:
+        raise HTTPException(status_code=401, detail="Not logged in. Please register or login first.")
+        
+    user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
     
@@ -203,18 +213,23 @@ def update_user_profile(data: UserProfileUpdate, db: Session = Depends(get_db)):
         
     return {"status": "success", "message": "Professional profile/bio updated successfully!"}
 
-# --- 5. ফ্লেক্সিবল সাবস্ক্রিপশন ও টপ-আপ (যখন খুশি কেনার সুবিধা) ---
+# --- 5. ফ্লেক্সিবল সাবস্ক্রিপশন ও টপ-আপ ---
 class SubscriptionActivateRequest(BaseModel):
-    email: str
     package_type: str  # "1_dollar" (2500 msgs) অথবা "4_dollar" (12000 msgs)
 
 @app.post("/activate-subscription")
-def activate_subscription(data: SubscriptionActivateRequest, db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.email == data.email).first()
+def activate_subscription(
+    data: SubscriptionActivateRequest, 
+    current_user_email: Optional[str] = Cookie(None), 
+    db: Session = Depends(get_db)
+):
+    if not current_user_email:
+        raise HTTPException(status_code=401, detail="Not logged in. Please register or login first.")
+        
+    user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Please log in or create an account first.")
         
-    # নতুন কত মেসেজ যোগ হবে তা নির্ধারণ
     added_limit = 0
     if data.package_type == "1_dollar":
         added_limit = 2500
@@ -225,14 +240,12 @@ def activate_subscription(data: SubscriptionActivateRequest, db: Session = Depen
         
     now = datetime.utcnow()
     
-    # যদি ইউজারের আগের প্রিমিয়ামের মেয়াদ এখনো থাকে, তবে কোটা ও মেয়াদ জমিয়ে (accumulate) দেওয়া হবে
     if user.is_premium and user.expiry_date and user.expiry_date > now:
         user.message_limit += added_limit
         user.expiry_date = user.expiry_date + timedelta(days=30)
     else:
-        # মেয়াদ শেষ হয়ে গেলে বা নতুন ইউজার হলে নতুন করে হিসাব শুরু হবে
         user.message_limit = added_limit
-        user.messages_used = 0  # নতুন প্যাকেজে রিসেট
+        user.messages_used = 0 
         user.expiry_date = now + timedelta(days=30)
         
     user.is_premium = True
@@ -271,24 +284,26 @@ async def upload_persona_voice(
     except Exception as e:
         return {"error": str(e)}
 
-# --- 6. মূল এআই প্রসেসিং রাউটার ---
+# --- 6. মূল এআই প্রসেসিং রাউটার (অটো কুকি ইমেইল রিডার সহ) ---
 @app.post("/process-ai")
 async def process_ai_request(
-    email: str = Form(...),
     mode: ModeEnum = Form(...),
     persona: Optional[PersonaEnum] = Form(PersonaEnum.Mother),
     target_language: Optional[LanguageEnum] = Form(LanguageEnum.Bengali),
     user_message: Optional[str] = Form(""),
     slide_content: Optional[str] = Form(""),
     file: Optional[UploadFile] = File(None),
+    current_user_email: Optional[str] = Cookie(None),
     db: Session = Depends(get_db)
 ):
     try:
-        user = db.query(UserDB).filter(UserDB.email == email).first()
+        if not current_user_email:
+            raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
+            
+        user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
             
-        # প্রিমিয়াম সাবস্ক্রিপশনের মেয়াদ শেষ হয়ে গেলে স্ট্যাটাস ফলস করা
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
             db.commit()
@@ -324,10 +339,8 @@ async def process_ai_request(
 
         contents.append(prompt)
         
-        # এআই কল করা (নিজের কি দিয়ে প্রথমে চেষ্টা করবে)
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
-        # যদি মাস্টার কি ব্যবহৃত হয়, তবে কোটা থেকে ১ মাইনাস হবে
         if key_used == "master":
             user.messages_used += 1
             db.commit()
@@ -336,6 +349,7 @@ async def process_ai_request(
 
         return {
             "status": "success",
+            "active_user": current_user_email,
             "key_used": key_used,
             "assigned_voice_file": assigned_voice_file,
             "response": ai_response_text,
@@ -354,11 +368,13 @@ async def process_ai_request(
 # --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম) ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
-async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session):
+async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
     try:
-        email = data.get("email")
-        user = db.query(UserDB).filter(UserDB.email == email).first()
-        
+        if not current_user_email:
+            await websocket.send_json({"status": "error", "message": "Not logged in."})
+            return
+
+        user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
         if not user:
             await websocket.send_json({"status": "error", "message": "User not found."})
             return
@@ -407,6 +423,11 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session):
 @app.websocket("/ws/live-ai")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    
+    # কুকি থেকে ইউজার ইমেইল রিড করা
+    cookies = websocket.cookies
+    current_user_email = cookies.get("current_user_email")
+    
     db = SessionLocal()
     try:
         while True:
@@ -418,7 +439,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except asyncio.CancelledError:
                     pass
 
-            task = asyncio.create_task(handle_ai_stream(websocket, data, db))
+            task = asyncio.create_task(handle_ai_stream(websocket, data, db, current_user_email))
             active_tasks[websocket] = task
     except WebSocketDisconnect:
         if websocket in active_tasks and not active_tasks[websocket].done():
