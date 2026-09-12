@@ -20,10 +20,9 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-# --- 1. ডাটাবেজ সেটআপ (Cloud PostgreSQL বা SQLite ফলব্যাক) ---
+# --- 1. ডাটাবেজ সেটআপ ---
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ai_saas_platform.db")
 
-# SQLite হলে check_same_thread আর্গুমেন্ট লাগবে, PostgreSQL হলে লাগবে না
 if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
     engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 else:
@@ -38,8 +37,8 @@ class UserDB(Base):
     email = Column(String, unique=True, index=True)
     user_api_key = Column(String, nullable=False)     # ইউজারের নিজস্ব জেমিনি কি
     is_premium = Column(Boolean, default=False)
-    message_limit = Column(Integer, default=0)       # যেমন: 2500 বা 12000
-    messages_used = Column(Integer, default=0)       # ব্যবহৃত মেসেজ কাউন্ট
+    message_limit = Column(Integer, default=0)       # মোট মাস্টার কি ব্যবহারের কোটা
+    messages_used = Column(Integer, default=0)       # মাস্টার কি থেকে কতগুলো মেসেজ খরচ হলো
     expiry_date = Column(DateTime, nullable=True)    # ৩০ দিনের মেয়াদ
     professional_bio = Column(Text, nullable=True)   # ইন্টারভিউ বা প্রফেশনাল মোডের বায়ো
 
@@ -67,7 +66,7 @@ master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Interview Mode & Smart Fallback", version="7.0")
+app = FastAPI(title="Humanised AI SaaS Platform with Flexible Top-up Logic", version="11.0")
 
 AUDIO_UPLOAD_DIR = "uploaded_voices"
 os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
@@ -112,20 +111,27 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "Humanised AI SaaS Platform is running smoothly with robust error handling!"}
+    return {"message": "AI Platform is running with Flexible Top-up & Smart Fallback Logic!"}
 
-# --- 3. স্মার্ট এআই কল উইথ ফুল ফলব্যাক, রিট্রাই ও সার্ভার ওভারলোড প্রোটেকশন ---
+# --- 3. স্মার্ট এআই কল ---
 async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False):
-    keys_to_try = [user.user_api_key]
+    keys_to_try = []
     
-    if user.is_premium and MASTER_API_KEYS:
+    # ১. সব সময় সবার আগে ইউজারের নিজের কি দিয়ে চেষ্টা করা হবে
+    keys_to_try.append(("user", user.user_api_key))
+    
+    # ২. ইউজার প্রিমিয়াম হলে এবং তার মাস্টার কি কোটা বাকি থাকলে ফলব্যাক হিসেবে মাস্টার কি যুক্ত হবে
+    if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
-            keys_to_try.append(next(master_key_cycle))
+            keys_to_try.append(("master", next(master_key_cycle)))
 
     last_exception = None
     
-    for index, api_key in enumerate(keys_to_try):
-        for attempt in range(2): # প্রতি কি-র জন্য সর্বোচ্চ ২ বার রিট্রাই চেষ্টা
+    for key_type, api_key in keys_to_try:
+        if key_type == "master" and (not user.is_premium or user.messages_used >= user.message_limit):
+            continue
+
+        for attempt in range(2):
             try:
                 async with ai_semaphore:
                     client = genai.Client(api_key=api_key)
@@ -135,25 +141,26 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                             contents=contents,
                             config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                         )
-                        return response_stream
+                        return response_stream, key_type
                     else:
                         response = client.models.generate_content(
                             model="gemini-3.6-flash",
                             contents=contents,
                             config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                         )
-                        return response.text.strip()
+                        return response.text.strip(), key_type
             except Exception as e:
                 error_str = str(e)
                 last_exception = e
                 
-                # যদি রেট লিমিট বা কোটা শেষ হয়, তবে সাথে সাথে ফলব্যাক কী-তে সুইচ করবে
-                if index == 0 and any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
-                    break 
+                if key_type == "user":
+                    if not user.is_premium:
+                        break
+                    if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
+                        break 
                 
-                # অন্যান্য টেম্পোরারি নেটওয়ার্ক এররের জন্য ২ সেকেন্ড অপেক্ষা করে একবার রিট্রাই করবে
                 if attempt == 0:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     continue
                 else:
                     break
@@ -180,7 +187,6 @@ def register_or_login(data: UserRegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "message": "Successfully logged in with API key!"}
 
-# --- professional_bio অপশনাল করা হয়েছে ---
 class UserProfileUpdate(BaseModel):
     email: str
     professional_bio: Optional[str] = None
@@ -197,9 +203,10 @@ def update_user_profile(data: UserProfileUpdate, db: Session = Depends(get_db)):
         
     return {"status": "success", "message": "Professional profile/bio updated successfully!"}
 
+# --- 5. ফ্লেক্সিবল সাবস্ক্রিপশন ও টপ-আপ (যখন খুশি কেনার সুবিধা) ---
 class SubscriptionActivateRequest(BaseModel):
     email: str
-    package_type: str
+    package_type: str  # "1_dollar" (2500 msgs) অথবা "4_dollar" (12000 msgs)
 
 @app.post("/activate-subscription")
 def activate_subscription(data: SubscriptionActivateRequest, db: Session = Depends(get_db)):
@@ -207,24 +214,37 @@ def activate_subscription(data: SubscriptionActivateRequest, db: Session = Depen
     if not user:
         raise HTTPException(status_code=404, detail="Please log in or create an account first.")
         
+    # নতুন কত মেসেজ যোগ হবে তা নির্ধারণ
+    added_limit = 0
     if data.package_type == "1_dollar":
-        user.message_limit = 2500
+        added_limit = 2500
     elif data.package_type == "4_dollar":
-        user.message_limit = 12000
+        added_limit = 12000
     else:
         raise HTTPException(status_code=400, detail="Invalid package type!")
         
-    user.messages_used = 0
-    user.is_premium = True
-    user.expiry_date = datetime.utcnow() + timedelta(days=30)
+    now = datetime.utcnow()
     
+    # যদি ইউজারের আগের প্রিমিয়ামের মেয়াদ এখনো থাকে, তবে কোটা ও মেয়াদ জমিয়ে (accumulate) দেওয়া হবে
+    if user.is_premium and user.expiry_date and user.expiry_date > now:
+        user.message_limit += added_limit
+        user.expiry_date = user.expiry_date + timedelta(days=30)
+    else:
+        # মেয়াদ শেষ হয়ে গেলে বা নতুন ইউজার হলে নতুন করে হিসাব শুরু হবে
+        user.message_limit = added_limit
+        user.messages_used = 0  # নতুন প্যাকেজে রিসেট
+        user.expiry_date = now + timedelta(days=30)
+        
+    user.is_premium = True
     db.commit()
     db.refresh(user)
     
     return {
         "status": "success",
-        "message": "Subscription activated successfully for 30 days!",
-        "message_limit": user.message_limit,
+        "message": "Subscription/Top-up added successfully!",
+        "total_message_limit": user.message_limit,
+        "messages_used": user.messages_used,
+        "remaining_messages": max(0, user.message_limit - user.messages_used),
         "expiry_date": user.expiry_date
     }
 
@@ -251,7 +271,7 @@ async def upload_persona_voice(
     except Exception as e:
         return {"error": str(e)}
 
-# --- 6. মূল এআই প্রসেসিং রাউটার (টোকেন লিমিট বৃদ্ধি করা হয়েছে যাতে উত্তর অর্ধেক কেটে না যায়) ---
+# --- 6. মূল এআই প্রসেসিং রাউটার ---
 @app.post("/process-ai")
 async def process_ai_request(
     email: str = Form(...),
@@ -268,13 +288,10 @@ async def process_ai_request(
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
             
-        if not user.is_premium or (user.expiry_date and datetime.utcnow() > user.expiry_date):
+        # প্রিমিয়াম সাবস্ক্রিপশনের মেয়াদ শেষ হয়ে গেলে স্ট্যাটাস ফলস করা
+        if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
             db.commit()
-            raise HTTPException(status_code=403, detail="Please buy subscription for more chat")
-            
-        if user.messages_used >= user.message_limit:
-            raise HTTPException(status_code=403, detail="Your message quota has been exhausted. Please renew your subscription.")
 
         contents = []
         if file:
@@ -295,39 +312,46 @@ async def process_ai_request(
                 f"Language: {lang_val}. "
                 f"Topic/Context: {slide_content}. "
                 f"Question asked by interviewer: {user_message}. "
-                f"Instructions: Give a confident, natural, and professional answer reflecting the candidate's background and details where applicable. If the question requires broader technical knowledge beyond the candidate's bio, use your expert intelligence to answer accurately."
+                f"Instructions: Give a confident, natural, and professional answer reflecting the candidate's background."
             )
-            max_tokens = 1500  # উত্তর যেন কেটে না যায় সেজন্য টোকেন বাড়িয়ে দেওয়া হলো
+            max_tokens = 1500
             temp_val = 0.3
         else:
             assigned_voice_file = USER_VOICE_SETTINGS.get(persona_val, "default_voice")
-            prompt = (
-                f"Act warmly and naturally as: {persona_val}. Language: {lang_val}. "
-                f"Message: {user_message}"
-            )
-            max_tokens = 1500  # উত্তর যেন কেটে না যায় সেজন্য টোকেন বাড়িয়ে দেওয়া হলো
+            prompt = f"Act warmly and naturally as: {persona_val}. Language: {lang_val}. Message: {user_message}"
+            max_tokens = 1500
             temp_val = 0.5
 
         contents.append(prompt)
         
-        ai_response_text = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
+        # এআই কল করা (নিজের কি দিয়ে প্রথমে চেষ্টা করবে)
+        ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
-        user.messages_used += 1
-        db.commit()
+        # যদি মাস্টার কি ব্যবহৃত হয়, তবে কোটা থেকে ১ মাইনাস হবে
+        if key_used == "master":
+            user.messages_used += 1
+            db.commit()
         
-        remaining = user.message_limit - user.messages_used
+        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
 
         return {
             "status": "success",
+            "key_used": key_used,
             "assigned_voice_file": assigned_voice_file,
             "response": ai_response_text,
             "remaining_messages": remaining
         }
             
     except Exception as e:
-        return {"error": str(e)}
+        error_msg = str(e)
+        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota"]):
+            if not user.is_premium:
+                return {"error": "Rate limit exceeded! Please wait a minute or buy a top-up package."}
+            else:
+                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait a minute."}
+        return {"error": error_msg}
 
-# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম ও নো-স্টোরেজ সরাসরি ফরওয়ার্ডিং) ---
+# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম) ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session):
@@ -335,10 +359,13 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session):
         email = data.get("email")
         user = db.query(UserDB).filter(UserDB.email == email).first()
         
-        # এখানে এক্সপায়ারি ডেট চেক সহ আপডেট করা হয়েছে
-        if not user or not user.is_premium or (user.expiry_date and datetime.utcnow() > user.expiry_date) or user.messages_used >= user.message_limit:
-            await websocket.send_json({"status": "error", "message": "Please buy subscription for more chat"})
+        if not user:
+            await websocket.send_json({"status": "error", "message": "User not found."})
             return
+
+        if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
+            user.is_premium = False
+            db.commit()
 
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
@@ -347,35 +374,35 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session):
         
         if mode == "presentation":
             user_bio = user.professional_bio if user.professional_bio else "No specific candidate bio provided."
-            prompt = (
-                f"You are attending a professional interview as the candidate. "
-                f"Candidate's Profile: {user_bio}. "
-                f"Language: {target_language}. "
-                f"Question: {user_message}"
-            )
+            prompt = f"You are attending a professional interview as the candidate. Profile: {user_bio}. Language: {target_language}. Question: {user_message}"
         else:
             prompt = f"Act as {persona} in language {target_language}. Message: {user_message}"
 
         await websocket.send_json({"status": "started"})
 
-        response_stream = await call_gemini_with_smart_fallback(user, [prompt], temp_val=0.5, max_tokens=1500, is_stream=True)
+        response_stream, key_used = await call_gemini_with_smart_fallback(user, [prompt], temp_val=0.5, max_tokens=1500, is_stream=True)
         
         for chunk in response_stream:
             if chunk.text:
-                # লোকাল মেমোরিতে জমিয়ে না রেখে সাথে সাথে ইউজারের কাছে পাঠিয়ে দেওয়া হচ্ছে
                 await websocket.send_json({"status": "streaming", "chunk": chunk.text})
             await asyncio.sleep(0.0001)
         
-        user.messages_used += 1
-        db.commit()
+        if key_used == "master":
+            user.messages_used += 1
+            db.commit()
 
-        await websocket.send_json({"status": "completed", "remaining_messages": user.message_limit - user.messages_used})
+        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
+        await websocket.send_json({"status": "completed", "key_used": key_used, "remaining_messages": remaining})
         
     except asyncio.CancelledError:
         await websocket.send_json({"status": "interrupted"})
         raise
     except Exception as e:
-        await websocket.send_json({"status": "error", "message": str(e)})
+        error_msg = str(e)
+        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota"]):
+            await websocket.send_json({"status": "error", "message": "Rate limit exceeded! Please top-up or wait a minute."})
+        else:
+            await websocket.send_json({"status": "error", "message": error_msg})
 
 @app.websocket("/ws/live-ai")
 async def websocket_endpoint(websocket: WebSocket):
