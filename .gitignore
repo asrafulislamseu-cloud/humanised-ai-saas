@@ -1,0 +1,5 @@
+__pycache__/
+.env
+ai_saas_platform.db
+uploaded_voices/
+.venv/
