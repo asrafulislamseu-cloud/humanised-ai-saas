@@ -13,7 +13,7 @@ from google import genai
 from google.genai import types
 
 # ডাটাবেজ ইম্পোর্ট (SQLAlchemy)
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, create_engine
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, create_engine, desc
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
@@ -42,6 +42,15 @@ class UserDB(Base):
     expiry_date = Column(DateTime, nullable=True)    # ৩০ দিনের মেয়াদ
     professional_bio = Column(Text, nullable=True)   # ইন্টারভিউ বা প্রফেশনাল মোডের বায়ো
 
+# চ্যাট হিস্ট্রি টেবিল (স্লাইডিং উইন্ডো মেমোরির জন্য)
+class ChatHistoryDB(Base):
+    __tablename__ = "chat_histories"
+    id = Column(Integer, primary_key=True, index=True)
+    user_email = Column(String, index=True)
+    role = Column(String)  # 'user' অথবা 'model'
+    message = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -62,12 +71,16 @@ raw_master_keys = os.getenv("GEMINI_MASTER_KEYS", "")
 MASTER_API_KEYS = [k.strip() for k in raw_master_keys.split(",") if k.strip()]
 master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 
+# ইউজারের নিজস্ব কি-এর জন্য কুলডাউন বা টাইমার ট্র্যাক করার ডিকশনারি
+user_cooldown_tracker: Dict[str, float] = {}
+COOLDOWN_DURATION = 65.0  # ৬৫ সেকেন্ড
+
 # সার্ভার ক্র্যাশ রোধে কনকারেন্সি কন্ট্রোল সেমাফোর
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
 # রেন্ডার সার্ভারের জন্য app অবজেক্ট ইনিশিয়ালাইজেশন
-app = FastAPI(title="Humanised AI SaaS Platform with Flexible Top-up Logic", version="11.0")
+app = FastAPI(title="Humanised AI SaaS Platform with Optimized Tokens & Timer", version="12.3")
 
 AUDIO_UPLOAD_DIR = "uploaded_voices"
 os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
@@ -112,19 +125,44 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Flexible Top-up & Smart Fallback Logic!"}
+    return {"message": "AI Platform is running with optimized token limits & Early Cooldown Guard!"}
 
-# --- 3. স্মার্ট এআই কল ---
+# --- সুনির্দিষ্ট ইউজারের জন্য শেষ ১ জোড়া (২টি এন্ট্রি: ১টি প্রশ্ন ও ১টি উত্তর) ফেচ করার ফাংশন ---
+def get_recent_chat_history(db: Session, email: str):
+    records = db.query(ChatHistoryDB).filter(ChatHistoryDB.user_email == email)\
+                .order_by(desc(ChatHistoryDB.id)).limit(2).all()
+    records.reverse()  # পুরনো থেকে নতুন ক্রমানুসারে সাজানো
+    
+    formatted_contents = []
+    for rec in records:
+        formatted_contents.append({"role": rec.role, "parts": [{"text": rec.message}]})
+    return formatted_contents
+
+# --- 3. স্মার্ট এআই কল ও কুলডাউন টাইমার লজিক সহ ফলব্যাক ---
 async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False):
     keys_to_try = []
+    current_time = time.time()
+    user_email = user.email
     
-    # ১. সব সময় সবার আগে ইউজারের নিজের কি দিয়ে চেষ্টা করা হবে
-    keys_to_try.append(("user", user.user_api_key))
+    # কুলডাউন চেক করা
+    is_in_cooldown = False
+    if user_email in user_cooldown_tracker:
+        if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
+            is_in_cooldown = True
+        else:
+            del user_cooldown_tracker[user_email]
+
+    # কুলডাউন না থাকলে ইউজারের নিজস্ব কি যোগ হবে
+    if not is_in_cooldown:
+        keys_to_try.append(("user", user.user_api_key))
     
-    # ২. ইউজার প্রিমিয়াম হলে এবং তার মাস্টার কি কোটা বাকি থাকলে ফলব্যাক হিসেবে মাস্টার কি যুক্ত হবে
+    # ইউজার প্রিমিয়াম হলে মাস্টার কি যুক্ত হবে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
+
+    if not user.is_premium and is_in_cooldown:
+        raise Exception("429 Rate limit active! Please hold 65 seconds.")
 
     last_exception = None
     
@@ -132,39 +170,32 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         if key_type == "master" and (not user.is_premium or user.messages_used >= user.message_limit):
             continue
 
-        for attempt in range(2):
-            try:
-                async with ai_semaphore:
-                    client = genai.Client(api_key=api_key)
-                    if is_stream:
-                        response_stream = client.models.generate_content_stream(
-                            model="gemini-3.6-flash",
-                            contents=contents,
-                            config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
-                        )
-                        return response_stream, key_type
-                    else:
-                        response = client.models.generate_content(
-                            model="gemini-3.6-flash",
-                            contents=contents,
-                            config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
-                        )
-                        return response.text.strip(), key_type
-            except Exception as e:
-                error_str = str(e)
-                last_exception = e
-                
-                if key_type == "user":
-                    if not user.is_premium:
-                        break
-                    if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
-                        break 
-                
-                if attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
+        try:
+            async with ai_semaphore:
+                client = genai.Client(api_key=api_key)
+                if is_stream:
+                    response_stream = client.models.generate_content_stream(
+                        model="gemini-3.6-flash",
+                        contents=contents,
+                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
+                    )
+                    return response_stream, key_type
                 else:
-                    break
+                    response = client.models.generate_content(
+                        model="gemini-3.6-flash",
+                        contents=contents,
+                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
+                    )
+                    return response.text.strip(), key_type
+        except Exception as e:
+            error_str = str(e)
+            last_exception = e
+            
+            # ইউজার কি-তে রেট লিমিট বা কোটা প্রবলেম পেলে কুলডাউন স্টার্ট হবে
+            if key_type == "user":
+                if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
+                    user_cooldown_tracker[user_email] = time.time()
+            continue
 
     raise last_exception
 
@@ -186,7 +217,6 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
         user.user_api_key = data.user_api_key.strip()
     
     db.commit()
-    
     response.set_cookie(key="current_user_email", value=data.email, httponly=True)
     return {"status": "success", "message": "Successfully logged in and active session created!"}
 
@@ -283,7 +313,7 @@ async def upload_persona_voice(
     except Exception as e:
         return {"error": str(e)}
 
-# --- 6. মূল এআই প্রসেসিং রাউটার ---
+# --- 6. মূল এআই প্রসেসিং রাউটার (হিস্ট্রি সহ) ---
 @app.post("/process-ai")
 async def process_ai_request(
     mode: ModeEnum = Form(...),
@@ -307,10 +337,22 @@ async def process_ai_request(
             user.is_premium = False
             db.commit()
 
-        contents = []
+        # --- ৬৫ সেকেন্ড শেষ হওয়ার আগে রিকোয়েস্ট ব্লক করার আর্লি চেক ---
+        if not user.is_premium and current_user_email in user_cooldown_tracker:
+            elapsed = time.time() - user_cooldown_tracker[current_user_email]
+            if elapsed < COOLDOWN_DURATION:
+                remaining_sec = int(COOLDOWN_DURATION - elapsed)
+                return {"error": f"Rate limit active! Please wait {remaining_sec} more seconds for cooldown to finish."}
+            else:
+                del user_cooldown_tracker[current_user_email]
+        # -------------------------------------------------------------
+
+        # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
+        contents = get_recent_chat_history(db, current_user_email)
+
         if file:
             file_bytes = await file.read()
-            contents.append(types.Part.from_bytes(data=file_bytes, mime_type=file.content_type))
+            contents.append({"role": "user", "parts": [types.Part.from_bytes(data=file_bytes, mime_type=file.content_type)]})
 
         mode_val = mode.value
         persona_val = persona.value if persona else "Mother"
@@ -326,23 +368,33 @@ async def process_ai_request(
                 f"Language: {lang_val}. "
                 f"Topic/Context: {slide_content}. "
                 f"Question asked by interviewer: {user_message}. "
-                f"Instructions: Give a confident, natural, and professional answer reflecting the candidate's background."
+                f"Instructions: Give a confident, professional, and direct answer. Avoid unnecessary fluff, long introductions, or filler words. Keep it focused strictly on the question, complete, and well-structured."
             )
-            max_tokens = 1500
+            max_tokens = 900
             temp_val = 0.3
         else:
             assigned_voice_file = USER_VOICE_SETTINGS.get(persona_val, "default_voice")
-            prompt = f"Act warmly and naturally as: {persona_val}. Language: {lang_val}. Message: {user_message}"
-            max_tokens = 1500
+            prompt = (
+                f"Act warmly and naturally as: {persona_val}. Language: {lang_val}. "
+                f"Message: {user_message}. "
+                f"Instructions: Be conversational, natural, and to the point. Do not write unnecessarily long paragraphs or irrelevant details. Keep the reply engaging, meaningful, and complete."
+            )
+            max_tokens = 800
             temp_val = 0.5
 
-        contents.append(prompt)
+        # বর্তমান প্রম্পট কনটেন্ট লিস্টে যোগ করা
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
         
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
+        # বর্তমান চ্যাট হিস্ট্রি ডাটাবেজে সেভ করা (ইউজার মেসেজ এবং মডেল রেসপন্স)
+        db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
+        db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=ai_response_text))
+        
         if key_used == "master":
             user.messages_used += 1
-            db.commit()
+            
+        db.commit()
         
         remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
 
@@ -357,14 +409,14 @@ async def process_ai_request(
             
     except Exception as e:
         error_msg = str(e)
-        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota"]):
+        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
             if not user.is_premium:
-                return {"error": "Rate limit exceeded! Please wait a minute or buy a top-up package."}
+                return {"error": "Rate limit exceeded! Please hold 65 seconds or buy a top-up package."}
             else:
-                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait a minute."}
+                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait 65 seconds."}
         return {"error": error_msg}
 
-# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম) ---
+# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম ও হিস্ট্রি সহ) ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
@@ -382,29 +434,60 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             user.is_premium = False
             db.commit()
 
+        # --- ওয়েবসকেটের জন্য ৬৫ সেকেন্ড কুলডাউন আর্লি চেক ---
+        if not user.is_premium and current_user_email in user_cooldown_tracker:
+            elapsed = time.time() - user_cooldown_tracker[current_user_email]
+            if elapsed < COOLDOWN_DURATION:
+                remaining_sec = int(COOLDOWN_DURATION - elapsed)
+                await websocket.send_json({"status": "error", "message": f"Rate limit active! Please wait {remaining_sec} more seconds."})
+                return
+            else:
+                del user_cooldown_tracker[current_user_email]
+        # ---------------------------------------------------
+
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
         target_language = data.get("target_language", "bn")
         user_message = data.get("user_message", "")
         
+        # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
+        contents = get_recent_chat_history(db, current_user_email)
+
         if mode == "presentation":
             user_bio = user.professional_bio if user.professional_bio else "No specific candidate bio provided."
-            prompt = f"You are attending a professional interview as the candidate. Profile: {user_bio}. Language: {target_language}. Question: {user_message}"
+            prompt = (
+                f"You are attending a professional interview. Profile: {user_bio}. "
+                f"Language: {target_language}. Question: {user_message}. "
+                f"Instructions: Be direct, professional, avoid unnecessary talk, and give a complete, well-structured answer."
+            )
+            max_tokens_val = 900
         else:
-            prompt = f"Act as {persona} in language {target_language}. Message: {user_message}"
+            prompt = (
+                f"Act as {persona} in language {target_language}. Message: {user_message}. "
+                f"Instructions: Be natural, concise, avoid unnecessary long explanations, and provide a complete reply."
+            )
+            max_tokens_val = 800
 
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
         await websocket.send_json({"status": "started"})
 
-        response_stream, key_used = await call_gemini_with_smart_fallback(user, [prompt], temp_val=0.5, max_tokens=1500, is_stream=True)
+        response_stream, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val=0.5, max_tokens=max_tokens_val, is_stream=True)
         
+        full_ai_response = ""
         for chunk in response_stream:
             if chunk.text:
+                full_ai_response += chunk.text
                 await websocket.send_json({"status": "streaming", "chunk": chunk.text})
             await asyncio.sleep(0.0001)
         
+        # স্ট্রিম শেষ হলে হিস্ট্রি সেভ করা
+        db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
+        db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=full_ai_response))
+        
         if key_used == "master":
             user.messages_used += 1
-            db.commit()
+            
+        db.commit()
 
         remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
         await websocket.send_json({"status": "completed", "key_used": key_used, "remaining_messages": remaining})
@@ -414,8 +497,8 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         raise
     except Exception as e:
         error_msg = str(e)
-        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota"]):
-            await websocket.send_json({"status": "error", "message": "Rate limit exceeded! Please top-up or wait a minute."})
+        if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
+            await websocket.send_json({"status": "error", "message": "Rate limit exceeded! Please hold 65 seconds or top-up."})
         else:
             await websocket.send_json({"status": "error", "message": error_msg})
 
