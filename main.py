@@ -35,6 +35,7 @@ class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
+    password = Column(String, nullable=True)          # ফ্লাটার ফর্মের পাসওয়ার্ড সেভ করার জন্য
     user_api_key = Column(String, nullable=False)     # ইউজারের নিজস্ব জেমিনি কি
     is_premium = Column(Boolean, default=False)
     message_limit = Column(Integer, default=0)       # মোট মাস্টার কি ব্যবহারের কোটা
@@ -80,7 +81,7 @@ MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
 # রেন্ডার সার্ভারের জন্য app অবজেক্ট ইনিশিয়ালাইজেশন
-app = FastAPI(title="Humanised AI SaaS Platform with Optimized Tokens & Timer", version="12.3")
+app = FastAPI(title="Humanised AI SaaS Platform with Optimized Tokens & Timer", version="12.2")
 
 AUDIO_UPLOAD_DIR = "uploaded_voices"
 os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
@@ -125,7 +126,7 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with optimized token limits & Early Cooldown Guard!"}
+    return {"message": "AI Platform is running with optimized token limits & 65s Cooldown Timer!"}
 
 # --- সুনির্দিষ্ট ইউজারের জন্য শেষ ১ জোড়া (২টি এন্ট্রি: ১টি প্রশ্ন ও ১টি উত্তর) ফেচ করার ফাংশন ---
 def get_recent_chat_history(db: Session, email: str):
@@ -199,9 +200,10 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     raise last_exception
 
-# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার ---
+# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার (ফ্লাটার ফর্ম অনুযায়ী আপডেট করা) ---
 class UserRegisterRequest(BaseModel):
     email: str
+    password: Optional[str] = ""
     user_api_key: str
 
 @app.post("/register-or-login")
@@ -211,10 +213,18 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
     
     user = db.query(UserDB).filter(UserDB.email == data.email).first()
     if not user:
-        user = UserDB(email=data.email, user_api_key=data.user_api_key.strip(), is_premium=False, message_limit=0)
+        user = UserDB(
+            email=data.email, 
+            password=data.password.strip() if data.password else "", 
+            user_api_key=data.user_api_key.strip(), 
+            is_premium=False, 
+            message_limit=0
+        )
         db.add(user)
     else:
         user.user_api_key = data.user_api_key.strip()
+        if data.password:
+            user.password = data.password.strip()
     
     db.commit()
     response.set_cookie(key="current_user_email", value=data.email, httponly=True)
@@ -337,16 +347,6 @@ async def process_ai_request(
             user.is_premium = False
             db.commit()
 
-        # --- ৬৫ সেকেন্ড শেষ হওয়ার আগে রিকোয়েস্ট ব্লক করার আর্লি চেক ---
-        if not user.is_premium and current_user_email in user_cooldown_tracker:
-            elapsed = time.time() - user_cooldown_tracker[current_user_email]
-            if elapsed < COOLDOWN_DURATION:
-                remaining_sec = int(COOLDOWN_DURATION - elapsed)
-                return {"error": f"Rate limit active! Please wait {remaining_sec} more seconds for cooldown to finish."}
-            else:
-                del user_cooldown_tracker[current_user_email]
-        # -------------------------------------------------------------
-
         # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
         contents = get_recent_chat_history(db, current_user_email)
 
@@ -433,17 +433,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
             db.commit()
-
-        # --- ওয়েবসকেটের জন্য ৬৫ সেকেন্ড কুলডাউন আর্লি চেক ---
-        if not user.is_premium and current_user_email in user_cooldown_tracker:
-            elapsed = time.time() - user_cooldown_tracker[current_user_email]
-            if elapsed < COOLDOWN_DURATION:
-                remaining_sec = int(COOLDOWN_DURATION - elapsed)
-                await websocket.send_json({"status": "error", "message": f"Rate limit active! Please wait {remaining_sec} more seconds."})
-                return
-            else:
-                del user_cooldown_tracker[current_user_email]
-        # ---------------------------------------------------
 
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
