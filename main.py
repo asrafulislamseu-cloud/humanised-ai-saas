@@ -6,6 +6,7 @@ import random
 import itertools
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict
 from enum import Enum
 from dotenv import load_dotenv
@@ -82,6 +83,15 @@ ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
 # রেন্ডার সার্ভারের জন্য app অবজেক্ট ইনিশিয়ালাইজেশন
 app = FastAPI(title="Humanised AI SaaS Platform with Optimized Tokens & Timer", version="12.2")
+
+# --- CORS পলিসি সেটআপ (ফ্লাটার ওয়েব থেকে রিকোয়েস্ট ব্লক রোধ করার জন্য) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 AUDIO_UPLOAD_DIR = "uploaded_voices"
 os.makedirs(AUDIO_UPLOAD_DIR, exist_ok=True)
