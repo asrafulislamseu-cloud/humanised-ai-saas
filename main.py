@@ -342,14 +342,17 @@ async def process_ai_request(
     user_message: Optional[str] = Form(""),
     slide_content: Optional[str] = Form(""),
     file: Optional[UploadFile] = File(None),
-    current_user_email: Optional[str] = Cookie(None),
+    current_user_email: Optional[str] = Form(None),
+    cookie_user_email: Optional[str] = Cookie(None, alias="current_user_email"),
     db: Session = Depends(get_db)
 ):
     try:
-        if not current_user_email:
+        active_email = current_user_email or cookie_user_email
+
+        if not active_email:
             raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
             
-        user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
+        user = db.query(UserDB).filter(UserDB.email == active_email).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
             
@@ -358,7 +361,7 @@ async def process_ai_request(
             db.commit()
 
         # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
-        contents = get_recent_chat_history(db, current_user_email)
+        contents = get_recent_chat_history(db, active_email)
 
         if file:
             file_bytes = await file.read()
@@ -398,8 +401,8 @@ async def process_ai_request(
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         # বর্তমান চ্যাট হিস্ট্রি ডাটাবেজে সেভ করা (ইউজার মেসেজ এবং মডেল রেসপন্স)
-        db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
-        db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=ai_response_text))
+        db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
+        db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
         
         if key_used == "master":
             user.messages_used += 1
@@ -410,7 +413,7 @@ async def process_ai_request(
 
         return {
             "status": "success",
-            "active_user": current_user_email,
+            "active_user": active_email,
             "key_used": key_used,
             "assigned_voice_file": assigned_voice_file,
             "response": ai_response_text,
@@ -506,12 +509,17 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     cookies = websocket.cookies
+    # প্রথম মেসেজ থেকে ইমেল রিসিভ করার ফলব্যাক অপশন যোগ করা হলো
     current_user_email = cookies.get("current_user_email")
     
     db = SessionLocal()
     try:
         while True:
             data = await websocket.receive_json()
+            
+            # যদি কুকিতে ইমেইল না থাকে, তবে ফ্লাটার থেকে পাঠানো ডাটার ভেতরে ইমেল থাকলে তা পিক করবে
+            active_email = current_user_email or data.get("current_user_email")
+
             if websocket in active_tasks and not active_tasks[websocket].done():
                 active_tasks[websocket].cancel()
                 try:
@@ -519,7 +527,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except asyncio.CancelledError:
                     pass
 
-            task = asyncio.create_task(handle_ai_stream(websocket, data, db, current_user_email))
+            task = asyncio.create_task(handle_ai_stream(websocket, data, db, active_email))
             active_tasks[websocket] = task
     except WebSocketDisconnect:
         if websocket in active_tasks and not active_tasks[websocket].done():
