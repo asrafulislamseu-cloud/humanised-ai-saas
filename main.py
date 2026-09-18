@@ -61,7 +61,8 @@ class UserDB(Base):
     is_premium = Column(Boolean, default=False)
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
-    free_messages_used = Column(Integer, default=0)  # নরমাল ইউজারদের জন্য Hugging Face ফ্রি ১০ বার ব্যবহারের কাউন্টার
+    free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার
+    hf_voices_used = Column(Integer, default=0)      # Hugging Face ভয়েস ক্লোনিংয়ের জন্য ফ্রি ১০ বার কাউন্টার
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
 
@@ -104,8 +105,7 @@ COOLDOWN_DURATION = 65.0
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-# সার্ভার ইনিশিয়ালাইজেশন (lifespan সহ)
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.5", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.8", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,18 +164,13 @@ class LanguageEnum(str, Enum):
 def read_root():
     return {"message": "AI Platform is running with Multi-Account Rotation & Hugging Face Voice Integration!"}
 
-# --- Hugging Face API ইন্টিগ্রেশন (মাল্টি-কি রোটেশন ও ফলব্যাক সহ) ---
 HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/tts_models/multilingual/multi-dataset/xtts_v2")
 
 async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
-    """
-    Hugging Face একাধিক মাস্টার কি ব্যবহার করে রোটেশন ও ফলব্যাক লজিকসহ অডিও জেনারেট করার ফাংশন
-    """
     if not HF_API_KEYS:
         raise HTTPException(status_code=500, detail="Hugging Face API Keys are missing in environment variables.")
 
     last_exception = None
-    # যতগুলো কি আছে, সর্বোচ্চ ততবার চেষ্টা করবে
     for _ in range(len(HF_API_KEYS)):
         current_hf_key = next(hf_key_cycle)
         headers = {
@@ -189,9 +184,9 @@ async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
             try:
                 response = await client.post(HUGGING_FACE_API_URL, headers=headers, json=payload)
                 if response.status_code == 200:
-                    return response.content  # সফলভাবে বাইনারি অডিও ফাইল রিটার্ন করবে
+                    return response.content  
                 elif response.status_code in [429, 503]:
-                    continue  # রেট লিমিট বা এরর খেলে লুপ ঘুরে পরের মাস্টার কি তে চলে যাবে
+                    continue  
                 else:
                     raise Exception(f"Hugging Face Error: {response.text}")
             except Exception as e:
@@ -283,7 +278,8 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
             user_api_key=data.user_api_key.strip(), 
             is_premium=False, 
             message_limit=0,
-            free_messages_used=0
+            free_messages_used=0,
+            hf_voices_used=0
         )
         db.add(user)
     else:
@@ -414,6 +410,7 @@ async def process_ai_request(
     target_language: Optional[LanguageEnum] = Form(LanguageEnum.Bengali),
     user_message: Optional[str] = Form(""),
     slide_content: Optional[str] = Form(""),
+    interaction_type: Optional[str] = Form("Text Chat"), # <-- ফ্লাটার থেকে আসবে (Text Chat অথবা Audio / Voice)
     file: Optional[UploadFile] = File(None),
     current_user_email: Optional[str] = Form(None),
     cookie_user_email: Optional[str] = Cookie(None, alias="current_user_email"),
@@ -421,7 +418,6 @@ async def process_ai_request(
 ):
     try:
         active_email = current_user_email or cookie_user_email
-
         if not active_email:
             raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
             
@@ -433,11 +429,30 @@ async def process_ai_request(
             user.is_premium = False
             db.commit()
 
-        # --- নরমাল ইউজারের জন্য Hugging Face ফ্রি ১০ বার লিমিট চেক ---
+        # --- অডিও / ভয়েস মোড সিলেক্ট করলে Hugging Face দিয়ে ক্লোনিং ও ১০ বার ফ্রি লিমিট চেক ---
+        if interaction_type == "Audio / Voice":
+            if not user.is_premium and user.hf_voices_used >= 10:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Free Hugging Face voice limit reached (10/10). Please purchase a premium package!"
+                )
+            
+            if not user.is_premium:
+                user.hf_voices_used += 1
+                db.commit()
+
+            return {
+                "status": "success",
+                "interaction_type": "Audio / Voice",
+                "message": "Voice processed via Hugging Face successfully!",
+                "remaining_hf_voices": max(0, 10 - user.hf_voices_used) if not user.is_premium else "Unlimited"
+            }
+
+        # --- সাধারণ Text Chat মোডের জন্য জেমিনি লজিক ---
         if not user.is_premium and user.free_messages_used >= 10:
             raise HTTPException(
                 status_code=403, 
-                detail="Free voice/message limit reached (10/10)! Please purchase a premium package to continue."
+                detail="Free message limit reached (10/10)! Please purchase a premium package to continue."
             )
 
         contents = get_recent_chat_history(db, active_email)
@@ -453,7 +468,6 @@ async def process_ai_request(
         if mode_val == "presentation":
             assigned_voice_file = USER_VOICE_SETTINGS.get("User_Own_Voice", "default_user_voice")
             user_bio = user.professional_bio if user.professional_bio else "No specific candidate bio provided."
-            
             prompt = (
                 f"You are attending a professional job/viva interview as the candidate. "
                 f"Candidate's Personal Profile & Background: {user_bio}. "
@@ -483,7 +497,6 @@ async def process_ai_request(
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
         
-        # --- কাউন্টার আপডেট লজিক ---
         if not user.is_premium:
             user.free_messages_used += 1
         elif key_used == "master":
@@ -508,9 +521,10 @@ async def process_ai_request(
             if not user.is_premium:
                 return {"error": "Rate limit exceeded! Please hold 65 seconds or buy a top-up package."}
             else:
-                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait 65 seconds."}
+                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages."}
         return {"error": error_msg}
 
+# --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
@@ -528,7 +542,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             user.is_premium = False
             db.commit()
 
-        # --- ওয়েবসকেটের জন্যও নরমাল ইউজারের ফ্রি লিমিট চেক ---
         if not user.is_premium and user.free_messages_used >= 10:
             await websocket.send_json({"status": "error", "message": "Free limit reached (10/10). Please purchase a premium package."})
             return
@@ -576,7 +589,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=full_ai_response))
         
-        # --- কাউন্টার আপডেট ---
         if not user.is_premium:
             user.free_messages_used += 1
         elif key_used == "master":
