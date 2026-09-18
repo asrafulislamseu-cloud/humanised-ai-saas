@@ -12,6 +12,8 @@ from enum import Enum
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+import httpx
+from contextlib import asynccontextmanager
 
 # ডাটাবেজ ইম্পোর্ট (SQLAlchemy)
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, create_engine, desc
@@ -20,6 +22,24 @@ from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 
 load_dotenv()
+
+# --- রেন্ডার সচল রাখার জন্য ব্যাকগ্রাউন্ড পিং লজিক (১৪ মিনিট পর পর) ---
+async def keep_alive_ping():
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000/")
+    while True:
+        await asyncio.sleep(840) # ৮^+$৪০ সেকেন্ড = ১৪ মিনিট
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(render_url)
+                print(f"Keep-alive ping sent, status: {response.status_code}")
+        except Exception as e:
+            print(f"Ping failed: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ping_task = asyncio.create_task(keep_alive_ping())
+    yield
+    ping_task.cancel()
 
 # --- 1. ডাটাবেজ সেটআপ ---
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ai_saas_platform.db")
@@ -36,20 +56,19 @@ class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
-    password = Column(String, nullable=True)          # ফ্লাটার ফর্মের পাসওয়ার্ড সেভ করার জন্য
-    user_api_key = Column(String, nullable=False)     # ইউজারের নিজস্ব জেমিনি কি
+    password = Column(String, nullable=True)          
+    user_api_key = Column(String, nullable=False)     
     is_premium = Column(Boolean, default=False)
-    message_limit = Column(Integer, default=0)       # মোট মাস্টার কি ব্যবহারের কোটা
-    messages_used = Column(Integer, default=0)       # মাস্টার কি থেকে কতগুলো মেসেজ খরচ হলো
-    expiry_date = Column(DateTime, nullable=True)    # ৩০ দিনের মেয়াদ
-    professional_bio = Column(Text, nullable=True)   # ইন্টারভিউ বা প্রফেশনাল মোডের বায়ো
+    message_limit = Column(Integer, default=0)       
+    messages_used = Column(Integer, default=0)       
+    expiry_date = Column(DateTime, nullable=True)    
+    professional_bio = Column(Text, nullable=True)   
 
-# চ্যাট হিস্ট্রি টেবিল (স্লাইডিং উইন্ডো মেমোরির জন্য)
 class ChatHistoryDB(Base):
     __tablename__ = "chat_histories"
     id = Column(Integer, primary_key=True, index=True)
     user_email = Column(String, index=True)
-    role = Column(String)  # 'user' অথবা 'model'
+    role = Column(String)  
     message = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -73,18 +92,15 @@ raw_master_keys = os.getenv("GEMINI_MASTER_KEYS", "")
 MASTER_API_KEYS = [k.strip() for k in raw_master_keys.split(",") if k.strip()]
 master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 
-# ইউজারের নিজস্ব কি-এর জন্য কুলডাউন বা টাইমার ট্র্যাক করার ডিকশনারি
 user_cooldown_tracker: Dict[str, float] = {}
-COOLDOWN_DURATION = 65.0  # ৬৫ সেকেন্ড
+COOLDOWN_DURATION = 65.0  
 
-# সার্ভার ক্র্যাশ রোধে কনকারেন্সি কন্ট্রোল সেমাফোর
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-# রেন্ডার সার্ভারের জন্য app অবজেক্ট ইনিশিয়ালাইজেশন
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language Support", version="12.3")
+# সার্ভার ইনিশিয়ালাইজেশন (lifespan সহ)
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.4", lifespan=lifespan)
 
-# --- CORS পলিসি সেটআপ (ফ্লাটার ওয়েব থেকে রিকোয়েস্ট ব্লক রোধ করার জন্য) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,7 +145,6 @@ class PersonaEnum(str, Enum):
     Professional = "Professional"
     Mentor = "Mentor"
 
-# --- নতুন ভাষাগুলো এখানে যুক্ত করা হলো ---
 class LanguageEnum(str, Enum):
     Bengali = "bn"
     English = "en"
@@ -141,26 +156,52 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Multi-Language (Bengali, English, Hindi, Chinese, Thai, Arabic, Spanish) Support!"}
+    return {"message": "AI Platform is running with Keep-Alive, Multi-Language, and Hugging Face Voice Integration Support!"}
 
-# --- সুনির্দিষ্ট ইউজারের জন্য শেষ ১ জোড়া (২টি এন্ট্রি: ১টি প্রশ্ন ও ১টি উত্তর) ফেচ করার ফাংশন ---
+# --- Hugging Face API ইন্টিগ্রেশন (ভয়েস ক্লোনিং / TTS) ---
+HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/your-tts-model-name")
+HUGGING_FACE_API_TOKEN = os.getenv("HUGGING_FACE_API_TOKEN", "")
+
+async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
+    """
+    Hugging Face API এর মাধ্যমে টেক্সট থেকে অডিও জেনারেট করার ফাংশন
+    """
+    if not HUGGING_FACE_API_TOKEN:
+        raise HTTPException(status_code=500, detail="Hugging Face API Token is missing in environment variables.")
+
+    headers = {
+        "Authorization": f"Bearer {HUGGING_FACE_API_TOKEN}"
+    }
+
+    payload = {
+        "inputs": text_to_speak,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(HUGGING_FACE_API_URL, headers=headers, json=payload)
+            if response.status_code == 200:
+                return response.content  # বাইনারি অডিও ফাইল
+            else:
+                raise Exception(f"Hugging Face Error: {response.text}")
+        except Exception as e:
+            raise Exception(f"Failed to connect to Hugging Face: {str(e)}")
+
 def get_recent_chat_history(db: Session, email: str):
     records = db.query(ChatHistoryDB).filter(ChatHistoryDB.user_email == email)\
                 .order_by(desc(ChatHistoryDB.id)).limit(2).all()
-    records.reverse()  # পুরনো থেকে নতুন ক্রমানুসারে সাজানো
+    records.reverse()  
     
     formatted_contents = []
     for rec in records:
         formatted_contents.append({"role": rec.role, "parts": [{"text": rec.message}]})
     return formatted_contents
 
-# --- 3. স্মার্ট এআই কল ও কুলডাউন টাইমার লজিক সহ ফলব্যাক ---
 async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False):
     keys_to_try = []
     current_time = time.time()
     user_email = user.email
     
-    # কুলডাউন চেক করা
     is_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
@@ -168,11 +209,9 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         else:
             del user_cooldown_tracker[user_email]
 
-    # কুলডাউন না থাকলে ইউজারের নিজস্ব কি যোগ হবে
     if not is_in_cooldown:
         keys_to_try.append(("user", user.user_api_key))
     
-    # ইউজার প্রিমিয়াম হলে মাস্টার কি যুক্ত হবে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
@@ -206,8 +245,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
-            
-            # ইউজার কি-তে রেট লিমিট বা কোটা প্রবলেম পেলে কুলডাউন স্টার্ট হবে
             if key_type == "user":
                 if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
                     user_cooldown_tracker[user_email] = time.time()
@@ -215,7 +252,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     raise last_exception
 
-# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার ---
 class UserRegisterRequest(BaseModel):
     email: str
     password: Optional[str] = ""
@@ -267,7 +303,6 @@ def update_user_profile(
         
     return {"status": "success", "message": "Professional profile/bio updated successfully!"}
 
-# --- 5. ফ্লেক্সিবল সাবস্ক্রিপশন ও টপ-আপ ---
 class SubscriptionActivateRequest(BaseModel):
     package_type: str
 
@@ -338,7 +373,6 @@ async def upload_persona_voice(
     except Exception as e:
         return {"error": str(e)}
 
-# --- সহায়ক ফাংশন: বাস্তব মানুষের মতো আবেগ ও কণ্ঠস্বর ফুটিয়ে তোলার গাইডলাইন ---
 def get_persona_behavior_rules(persona_val: str) -> str:
     if persona_val == "Father":
         return (
@@ -359,7 +393,6 @@ def get_persona_behavior_rules(persona_val: str) -> str:
     else:
         return "Speak naturally, warmly, and conversationally like a real human being."
 
-# --- 6. মূল এআই প্রসেসিং রাউটার (হিস্ট্রি, হিউম্যান-লাইক এক্সপ্রেশন ও নির্দিষ্ট টেম্পারেচার সহ) ---
 @app.post("/process-ai")
 async def process_ai_request(
     mode: ModeEnum = Form(...),
@@ -386,7 +419,6 @@ async def process_ai_request(
             user.is_premium = False
             db.commit()
 
-        # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
         contents = get_recent_chat_history(db, active_email)
 
         if file:
@@ -410,7 +442,7 @@ async def process_ai_request(
                 f"Instructions: Give a confident, professional, and direct answer. Avoid unnecessary fluff, long introductions, or filler words. Keep it focused strictly on the question, complete, and well-structured."
             )
             max_tokens = 900
-            temp_val = 0.4  # প্রেজেন্টেশনের জন্য নির্দিষ্ট টেম্পারেচার ০.৪
+            temp_val = 0.4  
         else:
             assigned_voice_file = USER_VOICE_SETTINGS.get(persona_val, "default_voice")
             persona_behavior_rules = get_persona_behavior_rules(persona_val)
@@ -421,14 +453,12 @@ async def process_ai_request(
                 f"Instructions: Keep it conversational, emotional, and completely natural like real human speech. Avoid long robotic paragraphs."
             )
             max_tokens = 800
-            temp_val = 0.5  # ইমোশনাল চ্যাটের জন্য নির্দিষ্ট টেম্পারেচার ০.৫
+            temp_val = 0.5  
 
-        # বর্তমান প্রম্পট কনটেন্ট লিস্টে যোগ করা
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
-        # বর্তমান চ্যাট হিস্ট্রি ডাটাবেজে সেভ করা (ইউজার মেসেজ এবং মডেল রেসপন্স)
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
         
@@ -457,7 +487,6 @@ async def process_ai_request(
                 return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait 65 seconds."}
         return {"error": error_msg}
 
-# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম ও নির্দিষ্ট টেম্পারেচার সহ) ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
@@ -480,7 +509,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         target_language = data.get("target_language", "bn")
         user_message = data.get("user_message", "")
         
-        # ডাটাবেজ থেকে শেষ ১ জোড়া হিস্ট্রি লোড করা
         contents = get_recent_chat_history(db, current_user_email)
 
         if mode == "presentation":
@@ -492,7 +520,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
                 f"Instructions: Be direct, professional, avoid unnecessary talk, and give a complete, well-structured answer."
             )
             max_tokens_val = 900
-            temp_val = 0.4  # ওয়েবসকেট প্রেজেন্টেশনের জন্য টেম্পারেচার ০.৪
+            temp_val = 0.4  
         else:
             persona_behavior_rules = get_persona_behavior_rules(persona)
             prompt = (
@@ -502,7 +530,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
                 f"Instructions: Keep it conversational, emotional, and completely natural like real human speech. Avoid long robotic paragraphs."
             )
             max_tokens_val = 800
-            temp_val = 0.5  # ওয়েবসকেট ইমোশনাল চ্যাটের জন্য টেম্পারেচার ০.৫
+            temp_val = 0.5  
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         await websocket.send_json({"status": "started"})
@@ -516,7 +544,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
                 await websocket.send_json({"status": "streaming", "chunk": chunk.text})
             await asyncio.sleep(0.0001)
         
-        # স্ট্রিম শেষ হলে হিস্ট্রি সেভ করা
         db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=full_ai_response))
         
