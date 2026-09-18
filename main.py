@@ -27,7 +27,7 @@ load_dotenv()
 async def keep_alive_ping():
     render_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000/")
     while True:
-        await asyncio.sleep(840) # ৮^+$৪০ সেকেন্ড = ১৪ মিনিট
+        await asyncio.sleep(840) # ১৪ মিনিট
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(render_url)
@@ -61,6 +61,7 @@ class UserDB(Base):
     is_premium = Column(Boolean, default=False)
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
+    free_messages_used = Column(Integer, default=0)  # নরমাল ইউজারদের জন্য Hugging Face ফ্রি ১০ বার ব্যবহারের কাউন্টার
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
 
@@ -81,7 +82,7 @@ def get_db():
     finally:
         db.close()
 
-# --- 2. মাল্টি-এপিআই কি ও মাস্টার কি পুল সেটআপ ---
+# --- 2. জেমিনি মাল্টি-এপিআই কি ও মাস্টার কি পুল সেটআপ ---
 raw_user_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
 if raw_user_keys:
     API_KEYS = [k.strip() for k in raw_user_keys.split(",") if k.strip()]
@@ -92,6 +93,11 @@ raw_master_keys = os.getenv("GEMINI_MASTER_KEYS", "")
 MASTER_API_KEYS = [k.strip() for k in raw_master_keys.split(",") if k.strip()]
 master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 
+# --- Hugging Face Master Keys & Rotation Setup ---
+raw_hf_keys = os.getenv("HUGGING_FACE_MASTER_KEYS", "") or os.getenv("HUGGING_FACE_API_TOKEN", "")
+HF_API_KEYS = [k.strip() for k in raw_hf_keys.split(",") if k.strip()]
+hf_key_cycle = itertools.cycle(HF_API_KEYS) if HF_API_KEYS else None
+
 user_cooldown_tracker: Dict[str, float] = {}
 COOLDOWN_DURATION = 65.0  
 
@@ -99,7 +105,7 @@ MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
 # সার্ভার ইনিশিয়ালাইজেশন (lifespan সহ)
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.4", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,36 +162,43 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Keep-Alive, Multi-Language, and Hugging Face Voice Integration Support!"}
+    return {"message": "AI Platform is running with Multi-Account Rotation & Hugging Face Voice Integration!"}
 
-# --- Hugging Face API ইন্টিগ্রেশন (ভয়েস ক্লোনিং / TTS) ---
-HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/your-tts-model-name")
-HUGGING_FACE_API_TOKEN = os.getenv("HUGGING_FACE_API_TOKEN", "")
+# --- Hugging Face API ইন্টিগ্রেশন (মাল্টি-কি রোটেশন ও ফলব্যাক সহ) ---
+HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/tts_models/multilingual/multi-dataset/xtts_v2")
 
 async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
     """
-    Hugging Face API এর মাধ্যমে টেক্সট থেকে অডিও জেনারেট করার ফাংশন
+    Hugging Face একাধিক মাস্টার কি ব্যবহার করে রোটেশন ও ফলব্যাক লজিকসহ অডিও জেনারেট করার ফাংশন
     """
-    if not HUGGING_FACE_API_TOKEN:
-        raise HTTPException(status_code=500, detail="Hugging Face API Token is missing in environment variables.")
+    if not HF_API_KEYS:
+        raise HTTPException(status_code=500, detail="Hugging Face API Keys are missing in environment variables.")
 
-    headers = {
-        "Authorization": f"Bearer {HUGGING_FACE_API_TOKEN}"
-    }
+    last_exception = None
+    # যতগুলো কি আছে, সর্বোচ্চ ততবার চেষ্টা করবে
+    for _ in range(len(HF_API_KEYS)):
+        current_hf_key = next(hf_key_cycle)
+        headers = {
+            "Authorization": f"Bearer {current_hf_key}"
+        }
+        payload = {
+            "inputs": text_to_speak,
+        }
 
-    payload = {
-        "inputs": text_to_speak,
-    }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(HUGGING_FACE_API_URL, headers=headers, json=payload)
+                if response.status_code == 200:
+                    return response.content  # সফলভাবে বাইনারি অডিও ফাইল রিটার্ন করবে
+                elif response.status_code in [429, 503]:
+                    continue  # রেট লিমিট বা এরর খেলে লুপ ঘুরে পরের মাস্টার কি তে চলে যাবে
+                else:
+                    raise Exception(f"Hugging Face Error: {response.text}")
+            except Exception as e:
+                last_exception = e
+                continue
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(HUGGING_FACE_API_URL, headers=headers, json=payload)
-            if response.status_code == 200:
-                return response.content  # বাইনারি অডিও ফাইল
-            else:
-                raise Exception(f"Hugging Face Error: {response.text}")
-        except Exception as e:
-            raise Exception(f"Failed to connect to Hugging Face: {str(e)}")
+    raise Exception(f"Failed to connect to Hugging Face using all keys: {str(last_exception)}")
 
 def get_recent_chat_history(db: Session, email: str):
     records = db.query(ChatHistoryDB).filter(ChatHistoryDB.user_email == email)\
@@ -269,7 +282,8 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
             password=data.password.strip() if data.password else "", 
             user_api_key=data.user_api_key.strip(), 
             is_premium=False, 
-            message_limit=0
+            message_limit=0,
+            free_messages_used=0
         )
         db.add(user)
     else:
@@ -419,6 +433,13 @@ async def process_ai_request(
             user.is_premium = False
             db.commit()
 
+        # --- নরমাল ইউজারের জন্য Hugging Face ফ্রি ১০ বার লিমিট চেক ---
+        if not user.is_premium and user.free_messages_used >= 10:
+            raise HTTPException(
+                status_code=403, 
+                detail="Free voice/message limit reached (10/10)! Please purchase a premium package to continue."
+            )
+
         contents = get_recent_chat_history(db, active_email)
 
         if file:
@@ -462,12 +483,15 @@ async def process_ai_request(
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
         
-        if key_used == "master":
+        # --- কাউন্টার আপডেট লজিক ---
+        if not user.is_premium:
+            user.free_messages_used += 1
+        elif key_used == "master":
             user.messages_used += 1
             
         db.commit()
         
-        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
+        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
 
         return {
             "status": "success",
@@ -503,6 +527,11 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
             db.commit()
+
+        # --- ওয়েবসকেটের জন্যও নরমাল ইউজারের ফ্রি লিমিট চেক ---
+        if not user.is_premium and user.free_messages_used >= 10:
+            await websocket.send_json({"status": "error", "message": "Free limit reached (10/10). Please purchase a premium package."})
+            return
 
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
@@ -547,12 +576,15 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=full_ai_response))
         
-        if key_used == "master":
+        # --- কাউন্টার আপডেট ---
+        if not user.is_premium:
+            user.free_messages_used += 1
+        elif key_used == "master":
             user.messages_used += 1
             
         db.commit()
 
-        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else 0
+        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
         await websocket.send_json({"status": "completed", "key_used": key_used, "remaining_messages": remaining})
         
     except asyncio.CancelledError:
