@@ -4,6 +4,7 @@ import asyncio
 import time
 import random
 import itertools
+import base64
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,10 +60,11 @@ class UserDB(Base):
     password = Column(String, nullable=True)          
     user_api_key = Column(String, nullable=False)     
     is_premium = Column(Boolean, default=False)
+    package_type = Column(String, nullable=True)     # "1_dollar" অথবা "4_dollar" ট্র্যাক করার জন্য
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
-    free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার
-    hf_voices_used = Column(Integer, default=0)      # Hugging Face ভয়েস ক্লোনিংয়ের জন্য ফ্রি ১০ বার কাউন্টার
+    free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার (ফ্রি ১০ বার)
+    hf_voices_used = Column(Integer, default=0)      # Hugging Face ভয়েস ক্লোনিং কাউন্টার
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
 
@@ -105,7 +107,7 @@ COOLDOWN_DURATION = 65.0
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="12.9", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="13.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,7 +164,7 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Multi-Account Rotation & Hugging Face Voice Integration!"}
+    return {"message": "AI Platform is running with Smart Key Fallback & HF Voice Integration!"}
 
 HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/tts_models/multilingual/multi-dataset/xtts_v2")
 
@@ -206,25 +208,30 @@ def get_recent_chat_history(db: Session, email: str):
     return formatted_contents
 
 async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False):
-    keys_to_try = []
     current_time = time.time()
     user_email = user.email
     
-    is_in_cooldown = False
+    # ইউজার কি কুলডাউন চেক করা (৬৫ সেকেন্ড পার হলে আবার ইউজারের কি-তেই ফিরে আসবে)
+    is_user_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
-            is_in_cooldown = True
+            is_user_in_cooldown = True
         else:
-            del user_cooldown_tracker[user_email]
+            del user_cooldown_tracker[user_email] # কুলডাউন শেষ, ইউজার কি আবার সক্রিয়!
 
-    if not is_in_cooldown:
+    keys_to_try = []
+
+    # যদি ইউজার কুলডাউনে না থাকে, তবে প্রথমে ইউজারের নিজস্ব কি দিয়ে ট্রাই করবে
+    if not is_user_in_cooldown and user.user_api_key:
         keys_to_try.append(("user", user.user_api_key))
     
+    # যদি ইউজার প্রিমিয়াম হয় এবং মাস্টার কি থাকে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
 
-    if not user.is_premium and is_in_cooldown:
+    # যদি ফ্রি ইউজার হয় এবং কুলডাউন চলতে থাকে
+    if not user.is_premium and is_user_in_cooldown:
         raise Exception("429 Rate limit active! Please hold 65 seconds.")
 
     last_exception = None
@@ -253,6 +260,7 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
+            # যদি ইউজারের নিজস্ব কি দিয়ে কল করার সময় 429 বা কোটা শেষ হয়, তবে তাকে কুলডাউনে পাঠিয়ে দেবো
             if key_type == "user":
                 if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
                     user_cooldown_tracker[user_email] = time.time()
@@ -331,9 +339,9 @@ def activate_subscription(
         
     added_limit = 0
     if data.package_type == "1_dollar":
-        added_limit = 2500
+        added_limit = 2500  # ২৫০০ মেসেজ
     elif data.package_type == "4_dollar":
-        added_limit = 12000
+        added_limit = 12000 # ১২০০০ মেসেজ
     else:
         raise HTTPException(status_code=400, detail="Invalid package type!")
         
@@ -348,12 +356,14 @@ def activate_subscription(
         user.expiry_date = now + timedelta(days=30)
         
     user.is_premium = True
+    user.package_type = data.package_type
     db.commit()
     db.refresh(user)
     
     return {
         "status": "success",
         "message": "Subscription/Top-up added successfully!",
+        "package_type": user.package_type,
         "total_message_limit": user.message_limit,
         "messages_used": user.messages_used,
         "remaining_messages": max(0, user.message_limit - user.messages_used),
@@ -427,9 +437,10 @@ async def process_ai_request(
             
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
+            user.package_type = None
             db.commit()
 
-        # ফ্রি টেক্সট চ্যাট লিমিট চেক
+        # ফ্রি টেক্সট চ্যাট লিমিট চেক (১০ বার)
         if not user.is_premium and interaction_type != "Audio / Voice" and user.free_messages_used >= 10:
             raise HTTPException(
                 status_code=403, 
@@ -473,33 +484,42 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
-        # জেমিনি থেকে রেসপন্স জেনারেট করা
+        # জেমিনি থেকে রেসপন্স জেনারেট করা (স্মার্ট ফলব্যাক সহ)
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
 
-        # --- যদি ইউজার Audio / Voice মোড সিলেক্ট করে ---
+        # --- Hugging Face ভয়েস ক্লোনিং লিমিট ও জেনারেশন ---
         has_hf_audio = False
+        encoded_audio_base64 = None
+        
         if interaction_type == "Audio / Voice":
-            if not user.is_premium and user.hf_voices_used >= 10:
+            hf_limit = 10
+            if user.is_premium:
+                if user.package_type == "1_dollar":
+                    hf_limit = 100
+                elif user.package_type == "4_dollar":
+                    hf_limit = 150
+
+            if user.hf_voices_used >= hf_limit:
                 raise HTTPException(
                     status_code=403, 
-                    detail="Free Hugging Face voice limit reached (10/10). Please purchase a premium package!"
+                    detail=f"Voice clone limit reached ({user.hf_voices_used}/{hf_limit}). Please upgrade or top-up!"
                 )
             
             try:
-                # Hugging Face থেকে ক্লোন ভয়েস অডিও বাইনারি তৈরি করা
                 audio_bytes = await generate_voice_from_hf(ai_response_text, assigned_voice_file)
                 if audio_bytes:
                     has_hf_audio = True
+                    encoded_audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
             except Exception as hf_err:
                 print(f"HF Audio Generation Failed: {hf_err}")
 
-            if not user.is_premium:
-                user.hf_voices_used += 1
+            user.hf_voices_used += 1
 
-        if not user.is_premium:
+        # কাউন্ট আপডেট (যদি ফ্রি ইউজার হয় টেক্সট চ্যাটে, অথবা মাস্টার কি ব্যবহার হয়)
+        if not user.is_premium and interaction_type != "Audio / Voice":
             user.free_messages_used += 1
         elif key_used == "master":
             user.messages_used += 1
@@ -507,7 +527,11 @@ async def process_ai_request(
         db.commit()
         
         remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
-        remaining_hf = max(0, 10 - user.hf_voices_used) if not user.is_premium else "Unlimited"
+        
+        hf_limit_display = 10
+        if user.is_premium:
+            hf_limit_display = 100 if user.package_type == "1_dollar" else 150
+        remaining_hf = max(0, hf_limit_display - user.hf_voices_used)
 
         return {
             "status": "success",
@@ -516,6 +540,7 @@ async def process_ai_request(
             "assigned_voice_file": assigned_voice_file,
             "response": ai_response_text,
             "has_audio": has_hf_audio,
+            "audio_base64": encoded_audio_base64,
             "remaining_messages": remaining,
             "remaining_hf_voices": remaining_hf
         }
@@ -524,9 +549,9 @@ async def process_ai_request(
         error_msg = str(e)
         if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
             if not user.is_premium:
-                return {"error": "Rate limit exceeded! Please hold 65 seconds or buy a top-up package."}
+                return {"error": "Rate limit exceeded! Please hold 65 seconds. After 65s, your own key will be active again."}
             else:
-                return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages."}
+                return {"error": "Rate limit exceeded! Switched to master key temporarily."}
         return {"error": error_msg}
 
 # --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
@@ -545,6 +570,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
 
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
+            user.package_type = None
             db.commit()
 
         if not user.is_premium and user.free_messages_used >= 10:
@@ -610,7 +636,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
     except Exception as e:
         error_msg = str(e)
         if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
-            await websocket.send_json({"status": "error", "message": "Rate limit exceeded! Please hold 65 seconds or top-up."})
+            await websocket.send_json({"status": "error", "message": "Rate limit exceeded! Please hold 65 seconds for your key to reset."})
         else:
             await websocket.send_json({"status": "error", "message": error_msg})
 
