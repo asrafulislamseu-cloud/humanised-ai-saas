@@ -82,7 +82,7 @@ MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
 # রেন্ডার সার্ভারের জন্য app অবজেক্ট ইনিশিয়ালাইজেশন
-app = FastAPI(title="Humanised AI SaaS Platform with Optimized Tokens & Timer", version="12.2")
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language Support", version="12.3")
 
 # --- CORS পলিসি সেটআপ (ফ্লাটার ওয়েব থেকে রিকোয়েস্ট ব্লক রোধ করার জন্য) ---
 app.add_middleware(
@@ -129,14 +129,19 @@ class PersonaEnum(str, Enum):
     Professional = "Professional"
     Mentor = "Mentor"
 
+# --- নতুন ভাষাগুলো এখানে যুক্ত করা হলো ---
 class LanguageEnum(str, Enum):
     Bengali = "bn"
     English = "en"
     Hindi = "hi"
+    Chinese = "zh"
+    Thai = "th"
+    Arabic = "ar"
+    Spanish = "es"
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with optimized token limits & 65s Cooldown Timer!"}
+    return {"message": "AI Platform is running with Multi-Language (Bengali, English, Hindi, Chinese, Thai, Arabic, Spanish) Support!"}
 
 # --- সুনির্দিষ্ট ইউজারের জন্য শেষ ১ জোড়া (২টি এন্ট্রি: ১টি প্রশ্ন ও ১টি উত্তর) ফেচ করার ফাংশন ---
 def get_recent_chat_history(db: Session, email: str):
@@ -210,7 +215,7 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     raise last_exception
 
-# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার (ফ্লাটার ফর্ম অনুযায়ী আপডেট করা) ---
+# --- 4. ইউজার রেজিস্ট্রেশন বা লগইন রাউটার ---
 class UserRegisterRequest(BaseModel):
     email: str
     password: Optional[str] = ""
@@ -333,7 +338,28 @@ async def upload_persona_voice(
     except Exception as e:
         return {"error": str(e)}
 
-# --- 6. মূল এআই প্রসেসিং রাউটার (হিস্ট্রি সহ) ---
+# --- সহায়ক ফাংশন: বাস্তব মানুষের মতো আবেগ ও কণ্ঠস্বর ফুটিয়ে তোলার গাইডলাইন ---
+def get_persona_behavior_rules(persona_val: str) -> str:
+    if persona_val == "Father":
+        return (
+            "Speak with a strict, protective, and authoritative tone like a real father. "
+            "Show slight anger or deep concern when correcting mistakes, but keep the underlying immense care evident."
+        )
+    elif persona_val == "Mother":
+        return (
+            "Speak with overflowing maternal warmth, deep affection, and soothing words like a real mother. "
+            "Make the user feel completely safe and loved."
+        )
+    elif persona_val in ["Wife", "Girlfriend"]:
+        return (
+            "Speak with natural romantic warmth, sweet jealousy, emotional attachment, and playful annoyance (abhiman). "
+            "Avoid dry or robotic sentences. Use natural human vocal expressions like 'Ummwah' or sweet affectionate sounds organically "
+            "instead of spamming mechanical emojis, making it sound entirely like a real person talking."
+        )
+    else:
+        return "Speak naturally, warmly, and conversationally like a real human being."
+
+# --- 6. মূল এআই প্রসেসিং রাউটার (হিস্ট্রি, হিউম্যান-লাইক এক্সপ্রেশন ও নির্দিষ্ট টেম্পারেচার সহ) ---
 @app.post("/process-ai")
 async def process_ai_request(
     mode: ModeEnum = Form(...),
@@ -378,22 +404,24 @@ async def process_ai_request(
             prompt = (
                 f"You are attending a professional job/viva interview as the candidate. "
                 f"Candidate's Personal Profile & Background: {user_bio}. "
-                f"Language: {lang_val}. "
+                f"Language Code: {lang_val}. Respond strictly in this language. "
                 f"Topic/Context: {slide_content}. "
                 f"Question asked by interviewer: {user_message}. "
                 f"Instructions: Give a confident, professional, and direct answer. Avoid unnecessary fluff, long introductions, or filler words. Keep it focused strictly on the question, complete, and well-structured."
             )
             max_tokens = 900
-            temp_val = 0.3
+            temp_val = 0.4  # প্রেজেন্টেশনের জন্য নির্দিষ্ট টেম্পারেচার ০.৪
         else:
             assigned_voice_file = USER_VOICE_SETTINGS.get(persona_val, "default_voice")
+            persona_behavior_rules = get_persona_behavior_rules(persona_val)
             prompt = (
-                f"Act warmly and naturally as: {persona_val}. Language: {lang_val}. "
-                f"Message: {user_message}. "
-                f"Instructions: Be conversational, natural, and to the point. Do not write unnecessarily long paragraphs or irrelevant details. Keep the reply engaging, meaningful, and complete."
+                f"Act as: {persona_val}. Language Code: {lang_val}. Respond strictly in this language. "
+                f"Human Behavior & Emotional Guidelines: {persona_behavior_rules} "
+                f"User Message: {user_message}. "
+                f"Instructions: Keep it conversational, emotional, and completely natural like real human speech. Avoid long robotic paragraphs."
             )
             max_tokens = 800
-            temp_val = 0.5
+            temp_val = 0.5  # ইমোশনাল চ্যাটের জন্য নির্দিষ্ট টেম্পারেচার ০.৫
 
         # বর্তমান প্রম্পট কনটেন্ট লিস্টে যোগ করা
         contents.append({"role": "user", "parts": [{"text": prompt}]})
@@ -429,7 +457,7 @@ async def process_ai_request(
                 return {"error": "Rate limit exceeded and master key quota is exhausted! Please top-up more messages or wait 65 seconds."}
         return {"error": error_msg}
 
-# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম ও হিস্ট্রি সহ) ---
+# --- 7. ওয়েবসকেট এন্ডপয়েন্ট (রিয়েল-টাইম স্ট্রিম ও নির্দিষ্ট টেম্পারেচার সহ) ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
@@ -459,21 +487,27 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             user_bio = user.professional_bio if user.professional_bio else "No specific candidate bio provided."
             prompt = (
                 f"You are attending a professional interview. Profile: {user_bio}. "
-                f"Language: {target_language}. Question: {user_message}. "
+                f"Language Code: {target_language}. Respond strictly in this language. "
+                f"Question: {user_message}. "
                 f"Instructions: Be direct, professional, avoid unnecessary talk, and give a complete, well-structured answer."
             )
             max_tokens_val = 900
+            temp_val = 0.4  # ওয়েবসকেট প্রেজেন্টেশনের জন্য টেম্পারেচার ০.৪
         else:
+            persona_behavior_rules = get_persona_behavior_rules(persona)
             prompt = (
-                f"Act as {persona} in language {target_language}. Message: {user_message}. "
-                f"Instructions: Be natural, concise, avoid unnecessary long explanations, and provide a complete reply."
+                f"Act as: {persona}. Language Code: {target_language}. Respond strictly in this language. "
+                f"Human Behavior & Emotional Guidelines: {persona_behavior_rules} "
+                f"User Message: {user_message}. "
+                f"Instructions: Keep it conversational, emotional, and completely natural like real human speech. Avoid long robotic paragraphs."
             )
             max_tokens_val = 800
+            temp_val = 0.5  # ওয়েবসকেট ইমোশনাল চ্যাটের জন্য টেম্পারেচার ০.৫
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         await websocket.send_json({"status": "started"})
 
-        response_stream, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val=0.5, max_tokens=max_tokens_val, is_stream=True)
+        response_stream, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val=temp_val, max_tokens=max_tokens_val, is_stream=True)
         
         full_ai_response = ""
         for chunk in response_stream:
@@ -509,15 +543,12 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     cookies = websocket.cookies
-    # প্রথম মেসেজ থেকে ইমেল রিসিভ করার ফলব্যাক অপশন যোগ করা হলো
     current_user_email = cookies.get("current_user_email")
     
     db = SessionLocal()
     try:
         while True:
             data = await websocket.receive_json()
-            
-            # যদি কুকিতে ইমেইল না থাকে, তবে ফ্লাটার থেকে পাঠানো ডাটার ভেতরে ইমেল থাকলে তা পিক করবে
             active_email = current_user_email or data.get("current_user_email")
 
             if websocket in active_tasks and not active_tasks[websocket].done():
