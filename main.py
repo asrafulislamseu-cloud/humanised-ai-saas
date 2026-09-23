@@ -1,4 +1,4 @@
-Import os
+import os
 import json
 import asyncio
 import time
@@ -228,7 +228,7 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
             keys_to_try.append(("master", next(master_key_cycle)))
 
     if not user.is_premium and is_user_in_cooldown:
-        raise HTTPException(status_code=429, detail="Rate limit active! Please hold 65 seconds.")
+        raise Exception("429 Rate limit active! Please hold 65 seconds.")
 
     last_exception = None
     
@@ -239,26 +239,26 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         try:
             async with ai_semaphore:
                 client = genai.Client(api_key=api_key)
-                
-                config = types.GenerateContentConfig(
-                    temperature=temp_val, 
-                    max_output_tokens=max_tokens
-                )
-                
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
                         model="gemini-3.6-flash",
                         contents=contents,
-                        config=config
+                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
                         model="gemini-3.6-flash",
                         contents=contents,
-                        config=config
+                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
-                    return response.text.strip(), key_type
+                    # নিরাপদভাবে টেক্সট এক্সট্রাক্ট করার ব্যবস্থা
+                    res_text = ""
+                    if hasattr(response, "text") and response.text:
+                        res_text = response.text
+                    elif response.candidates:
+                        res_text = response.candidates[0].content.parts[0].text
+                    return res_text.strip(), key_type
         except Exception as e:
             error_str = str(e)
             last_exception = e
@@ -267,7 +267,7 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                     user_cooldown_tracker[user_email] = time.time()
             continue
 
-    raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(last_exception)}")
+    raise last_exception
 
 class UserRegisterRequest(BaseModel):
     email: str
@@ -551,6 +551,7 @@ async def process_ai_request(
                 return {"error": "Rate limit exceeded! Switched to master key temporarily."}
         return {"error": error_msg}
 
+# --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
@@ -608,9 +609,19 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         
         full_ai_response = ""
         for chunk in response_stream:
-            if chunk.text:
-                full_ai_response += chunk.text
-                await websocket.send_json({"status": "streaming", "chunk": chunk.text})
+            # স্ট্রিম থেকে নিরাপদভাবে টেক্সট এক্সট্রাক্ট করার লজিক
+            chunk_text = ""
+            if hasattr(chunk, "text") and chunk.text:
+                chunk_text = chunk.text
+            elif hasattr(chunk, "candidates") and chunk.candidates:
+                try:
+                    chunk_text = chunk.candidates[0].content.parts[0].text
+                except Exception:
+                    pass
+
+            if chunk_text:
+                full_ai_response += chunk_text
+                await websocket.send_json({"status": "streaming", "chunk": chunk_text})
             await asyncio.sleep(0.0001)
         
         db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
