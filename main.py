@@ -211,28 +211,24 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
     current_time = time.time()
     user_email = user.email
     
-    # ইউজার কি কুলডাউন চেক করা (৬৫ সেকেন্ড পার হলে আবার ইউজারের কি-তেই ফিরে আসবে)
     is_user_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
             is_user_in_cooldown = True
         else:
-            del user_cooldown_tracker[user_email] # কুলডাউন শেষ, ইউজার কি আবার সক্রিয়!
+            del user_cooldown_tracker[user_email]
 
     keys_to_try = []
 
-    # যদি ইউজার কুলডাউনে না থাকে, তবে প্রথমে ইউজারের নিজস্ব কি দিয়ে ট্রাই করবে
     if not is_user_in_cooldown and user.user_api_key:
         keys_to_try.append(("user", user.user_api_key))
     
-    # যদি ইউজার প্রিমিয়াম হয় এবং মাস্টার কি থাকে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
 
-    # যদি ফ্রি ইউজার হয় এবং কুলডাউন চলতে থাকে
     if not user.is_premium and is_user_in_cooldown:
-        raise Exception("429 Rate limit active! Please hold 65 seconds.")
+        raise HTTPException(status_code=429, detail="Rate limit active! Please hold 65 seconds.")
 
     last_exception = None
     
@@ -242,31 +238,40 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
         try:
             async with ai_semaphore:
+                # নতুন লাইব্রেরির অফিশিয়াল ক্লায়েন্ট ইনিশিয়ালাইজেশন
                 client = genai.Client(api_key=api_key)
+                
+                # নতুন google-genai SDK-র সঠিক কনফিগারেশন ফরম্যাট
+                config = types.GenerateContentConfig(
+                    temperature=temp_val, 
+                    max_output_tokens=max_tokens
+                )
+                
+                # মডেলের নাম সরাসরি 'gemini-3.1-flash-lite' ব্যবহার করা হচ্ছে
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
-                        model="models/gemini-3.1-flash-lite",
+                        model="gemini-3.1-flash-lite",
                         contents=contents,
-                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
+                        config=config
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
-                        model="models/gemini-3.1-flash-lite",
+                        model="gemini-3.1-flash-lite",
                         contents=contents,
-                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
+                        config=config
                     )
                     return response.text.strip(), key_type
         except Exception as e:
             error_str = str(e)
             last_exception = e
-            # যদি ইউজারের নিজস্ব কি দিয়ে কল করার সময় 429 বা কোটা শেষ হয়, তবে তাকে কুলডাউনে পাঠিয়ে দেবো
             if key_type == "user":
                 if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
                     user_cooldown_tracker[user_email] = time.time()
             continue
 
-    raise last_exception
+    # সব কি ফেইল করলে সুনির্দিষ্ট ডিটেইল সহ HTTPException থ্রো করবে
+    raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(last_exception)}")
 
 class UserRegisterRequest(BaseModel):
     email: str
