@@ -1,4 +1,4 @@
-import os
+Import os
 import json
 import asyncio
 import time
@@ -238,26 +238,23 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
         try:
             async with ai_semaphore:
-                # নতুন লাইব্রেরির অফিশিয়াল ক্লায়েন্ট ইনিশিয়ালাইজেশন
                 client = genai.Client(api_key=api_key)
                 
-                # নতুন google-genai SDK-র সঠিক কনফিগারেশন ফরম্যাট
                 config = types.GenerateContentConfig(
                     temperature=temp_val, 
                     max_output_tokens=max_tokens
                 )
                 
-                # মডেলের নাম সরাসরি 'gemini-3.1-flash-lite' ব্যবহার করা হচ্ছে
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
-                        model="gemini-3.1-flash-lite",
+                        model="gemini-3.6-flash",
                         contents=contents,
                         config=config
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
-                        model="gemini-3.1-flash-lite",
+                        model="gemini-3.6-flash",
                         contents=contents,
                         config=config
                     )
@@ -270,7 +267,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                     user_cooldown_tracker[user_email] = time.time()
             continue
 
-    # সব কি ফেইল করলে সুনির্দিষ্ট ডিটেইল সহ HTTPException থ্রো করবে
     raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(last_exception)}")
 
 class UserRegisterRequest(BaseModel):
@@ -344,9 +340,9 @@ def activate_subscription(
         
     added_limit = 0
     if data.package_type == "1_dollar":
-        added_limit = 2500  # ২৫০০ মেসেজ
+        added_limit = 2500  
     elif data.package_type == "4_dollar":
-        added_limit = 12000 # ১২০০০ মেসেজ
+        added_limit = 12000 
     else:
         raise HTTPException(status_code=400, detail="Invalid package type!")
         
@@ -445,7 +441,6 @@ async def process_ai_request(
             user.package_type = None
             db.commit()
 
-        # ফ্রি টেক্সট চ্যাট লিমিট চেক (১০ বার)
         if not user.is_premium and interaction_type != "Audio / Voice" and user.free_messages_used >= 10:
             raise HTTPException(
                 status_code=403, 
@@ -489,13 +484,11 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
-        # জেমিনি থেকে রেসপন্স জেনারেট করা (স্মার্ট ফলব্যাক সহ)
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
 
-        # --- Hugging Face ভয়েস ক্লোনিং লিমিট ও জেনারেশন ---
         has_hf_audio = False
         encoded_audio_base64 = None
         
@@ -523,7 +516,6 @@ async def process_ai_request(
 
             user.hf_voices_used += 1
 
-        # কাউন্ট আপডেট (যদি ফ্রি ইউজার হয় টেক্সট চ্যাটে, অথবা মাস্টার কি ব্যবহার হয়)
         if not user.is_premium and interaction_type != "Audio / Voice":
             user.free_messages_used += 1
         elif key_used == "master":
@@ -559,7 +551,6 @@ async def process_ai_request(
                 return {"error": "Rate limit exceeded! Switched to master key temporarily."}
         return {"error": error_msg}
 
-# --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
