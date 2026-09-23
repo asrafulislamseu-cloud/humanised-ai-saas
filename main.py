@@ -172,19 +172,40 @@ async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
     if not HF_API_KEYS:
         raise HTTPException(status_code=500, detail="Hugging Face API Keys are missing in environment variables.")
 
+    audio_file_bytes = None
+    if reference_audio_path and os.path.exists(reference_audio_path):
+        with open(reference_audio_path, "rb") as f:
+            audio_file_bytes = f.read()
+
     last_exception = None
     for _ in range(len(HF_API_KEYS)):
         current_hf_key = next(hf_key_cycle)
         headers = {
             "Authorization": f"Bearer {current_hf_key}"
         }
-        payload = {
-            "inputs": text_to_speak,
-        }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        files = {}
+        if audio_file_bytes:
+            files = {
+                "speaker_wav": ("reference.wav", audio_file_bytes, "audio/wav")
+            }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
             try:
-                response = await client.post(HUGGING_FACE_API_URL, headers=headers, json=payload)
+                if files:
+                    response = await client.post(
+                        HUGGING_FACE_API_URL, 
+                        headers=headers, 
+                        data={"inputs": text_to_speak}, 
+                        files=files
+                    )
+                else:
+                    response = await client.post(
+                        HUGGING_FACE_API_URL, 
+                        headers=headers, 
+                        json={"inputs": text_to_speak}
+                    )
+
                 if response.status_code == 200:
                     return response.content  
                 elif response.status_code in [429, 503]:
@@ -252,7 +273,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
-                    # নিরাপদভাবে টেক্সট এক্সট্রাক্ট করার ব্যবস্থা
                     res_text = ""
                     if hasattr(response, "text") and response.text:
                         res_text = response.text
@@ -609,7 +629,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         
         full_ai_response = ""
         for chunk in response_stream:
-            # স্ট্রিম থেকে নিরাপদভাবে টেক্সট এক্সট্রাক্ট করার লজিক
             chunk_text = ""
             if hasattr(chunk, "text") and chunk.text:
                 chunk_text = chunk.text
