@@ -211,26 +211,22 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
     current_time = time.time()
     user_email = user.email
     
-    # ইউজার কি কুলডাউন চেক করা (৬৫ সেকেন্ড পার হলে আবার ইউজারের কি-তেই ফিরে আসবে)
     is_user_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
             is_user_in_cooldown = True
         else:
-            del user_cooldown_tracker[user_email] # কুলডাউন শেষ, ইউজার কি আবার সক্রিয়!
+            del user_cooldown_tracker[user_email]
 
     keys_to_try = []
 
-    # যদি ইউজার কুলডাউনে না থাকে, তবে প্রথমে ইউজারের নিজস্ব কি দিয়ে ট্রাই করবে
     if not is_user_in_cooldown and user.user_api_key:
         keys_to_try.append(("user", user.user_api_key))
     
-    # যদি ইউজার প্রিমিয়াম হয় এবং মাস্টার কি থাকে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
 
-    # যদি ফ্রি ইউজার হয় এবং কুলডাউন চলতে থাকে
     if not user.is_premium and is_user_in_cooldown:
         raise Exception("429 Rate limit active! Please hold 65 seconds.")
 
@@ -245,14 +241,14 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                 client = genai.Client(api_key=api_key)
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
-                        model="gemini-3.6-flash",
+                        model="gemini-1.5-flash",  # <--- মডেলের নাম আপডেট করা হয়েছে
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
-                        model="gemini-3.6-flash",
+                        model="gemini-1.5-flash",  # <--- মডেলের নাম আপডেট করা হয়েছে
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
@@ -260,7 +256,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
-            # যদি ইউজারের নিজস্ব কি দিয়ে কল করার সময় 429 বা কোটা শেষ হয়, তবে তাকে কুলডাউনে পাঠিয়ে দেবো
             if key_type == "user":
                 if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
                     user_cooldown_tracker[user_email] = time.time()
@@ -339,9 +334,9 @@ def activate_subscription(
         
     added_limit = 0
     if data.package_type == "1_dollar":
-        added_limit = 2500  # ২৫০০ মেসেজ
+        added_limit = 2500  
     elif data.package_type == "4_dollar":
-        added_limit = 12000 # ১২০০০ মেসেজ
+        added_limit = 12000 
     else:
         raise HTTPException(status_code=400, detail="Invalid package type!")
         
@@ -440,7 +435,6 @@ async def process_ai_request(
             user.package_type = None
             db.commit()
 
-        # ফ্রি টেক্সট চ্যাট লিমিট চেক (১০ বার)
         if not user.is_premium and interaction_type != "Audio / Voice" and user.free_messages_used >= 10:
             raise HTTPException(
                 status_code=403, 
@@ -484,13 +478,11 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
-        # জেমিনি থেকে রেসপন্স জেনারেট করা (স্মার্ট ফলব্যাক সহ)
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
 
-        # --- Hugging Face ভয়েস ক্লোনিং লিমিট ও জেনারেশন ---
         has_hf_audio = False
         encoded_audio_base64 = None
         
@@ -518,7 +510,6 @@ async def process_ai_request(
 
             user.hf_voices_used += 1
 
-        # কাউন্ট আপডেট (যদি ফ্রি ইউজার হয় টেক্সট চ্যাটে, অথবা মাস্টার কি ব্যবহার হয়)
         if not user.is_premium and interaction_type != "Audio / Voice":
             user.free_messages_used += 1
         elif key_used == "master":
