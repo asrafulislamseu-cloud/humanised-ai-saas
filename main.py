@@ -241,14 +241,14 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                 client = genai.Client(api_key=api_key)
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
-                        model="gemini-1.5-flash",  # <--- মডেলের নাম আপডেট করা হয়েছে
+                        model="gemini-2.0-flash",  # <--- আপডেট করা মডেলের নাম
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
-                        model="gemini-1.5-flash",  # <--- মডেলের নাম আপডেট করা হয়েছে
+                        model="gemini-2.0-flash",  # <--- আপডেট করা মডেলের নাম
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
