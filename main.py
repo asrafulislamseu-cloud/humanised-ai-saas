@@ -64,12 +64,12 @@ class UserDB(Base):
     package_type = Column(String, nullable=True)     
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
-    free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার (ফ্রি ১০ বার)
-    edge_tts_used = Column(Integer, default=0)       # Edge TTS দৈনিক ব্যবহার কাউন্টার (সম্পূর্ণ আলাদা)
-    voice_clone_used = Column(Integer, default=0)    # ভয়েস ক্লোনিং দৈনিক কাউন্টার
+    free_messages_used = Column(Integer, default=0)  
+    edge_tts_used = Column(Integer, default=0)       
+    voice_clone_used = Column(Integer, default=0)    
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
-    last_reset_date = Column(String, nullable=True)  # দৈনিক লিমিট রিসেট ট্র্যাক করার জন্য
+    last_reset_date = Column(String, nullable=True)  
 
 class ChatHistoryDB(Base):
     __tablename__ = "chat_histories"
@@ -116,7 +116,7 @@ COOLDOWN_DURATION = 65.0
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Edge-TTS & Smart Key Fallback", version="14.2", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Edge-TTS & Smart Key Fallback", version="14.3", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -249,7 +249,7 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with independent Edge-TTS & Smart Key Fallback!"}
+    return {"message": "AI Platform is running with unlimited voice/text & Smart Key Fallback!"}
 
 # --- Edge TTS অডিও জেনারেশন ফাংশন ---
 async def generate_voice_from_edge(text_to_speak: str, lang_code: str, persona_val: str) -> bytes:
@@ -459,18 +459,7 @@ async def upload_persona_voice(
             
         check_and_reset_daily_limits(user)
 
-        if not user.is_premium:
-            raise HTTPException(
-                status_code=403,
-                detail="Custom voice cloning is a premium feature! Please purchase a premium package to unlock voice cloning."
-            )
-
-        if user.voice_clone_used >= 30:
-            raise HTTPException(
-                status_code=403,
-                detail="Daily voice cloning limit reached (30/30). Please try again tomorrow."
-            )
-
+        # ভয়েস ক্লোনিং এর প্রিমিয়াম ও দৈনিক লিমিট চেক সম্পূর্ণ তুলে দেওয়া হলো
         persona_val = persona_or_mode.value
         file_extension = os.path.splitext(voice_file.filename)[1]
         safe_name = f"{active_email.replace('@', '_').replace('.', '_')}_{persona_val}"
@@ -490,7 +479,7 @@ async def upload_persona_voice(
         return {
             "status": "success",
             "voice_file_path": file_path,
-            "remaining_voice_clones": max(0, 30 - user.voice_clone_used)
+            "remaining_voice_clones": 99999
         }
     except HTTPException as he:
         raise he
@@ -554,12 +543,7 @@ async def process_ai_request(
             user.package_type = None
             db.commit()
 
-        # --- সম্পূর্ণ স্বাধীন জেমিনি টেক্সট চ্যাট লিমিট চেক ---
-        if not user.is_premium and interaction_type != "Audio / Voice" and user.free_messages_used >= 10:
-            raise HTTPException(
-                status_code=403, 
-                detail="Free text message limit reached (10/10)! Please purchase a premium package to continue."
-            )
+        # টেক্সট চ্যাট এবং ভয়েস চ্যাটের সব ধরনের লিমিট চেক এখানে রিমুভ করা হয়েছে
 
         mode_val = mode.value
         persona_val = persona.value if persona else "Mother"
@@ -596,7 +580,6 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
-        # জেমিনি এআই থেকে মাত্র একবার টেক্সট রেসপন্স কল করা হচ্ছে
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
@@ -605,14 +588,8 @@ async def process_ai_request(
         has_audio = False
         encoded_audio_base64 = None
         
-        # --- সম্পূর্ণ স্বাধীন Edge TTS ভয়েস লিমিট চেক (জেমিনির সাথে এর কোনো সম্পর্ক নেই) ---
+        # --- অডিও মোডের লিমিট রিমুভ করা হয়েছে ---
         if interaction_type == "Audio / Voice":
-            tts_limit = 90 if user.is_premium else 30
-
-            if user.edge_tts_used >= tts_limit:
-                limit_msg = "Daily voice generation limit reached (90/90). Please try again tomorrow!" if user.is_premium else "Daily voice generation limit reached (30/30). Upgrade to premium for 90 daily voice generations!"
-                raise HTTPException(status_code=403, detail=limit_msg)
-            
             try:
                 audio_bytes = await generate_voice_from_edge(ai_response_text, lang_val, persona_val)
                 if audio_bytes:
@@ -623,17 +600,13 @@ async def process_ai_request(
 
             user.edge_tts_used += 1
 
-        # কাউন্টার আপডেট (টেক্সট চ্যাট বা ভয়েস চ্যাট অনুযায়ী স্বাধীনভাবে বাড়বে)
-        if not user.is_premium and interaction_type != "Audio / Voice":
-            user.free_messages_used += 1
-        elif key_used == "master":
+        if key_used == "master":
             user.messages_used += 1
             
         db.commit()
         
-        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
-        max_tts_display = 90 if user.is_premium else 30
-        remaining_tts = max(0, max_tts_display - user.edge_tts_used)
+        remaining = 99999
+        remaining_tts = 99999
 
         return {
             "status": "success",
@@ -681,9 +654,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             user.package_type = None
             db.commit()
 
-        if not user.is_premium and user.free_messages_used >= 10:
-            await websocket.send_json({"status": "error", "message": "Free text limit reached (10/10). Please purchase a premium package."})
-            return
+        # WebSocket এর ফ্রি লিমিট চেক রিমুভ করা হলো
 
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
@@ -737,15 +708,12 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         db.add(ChatHistoryDB(user_email=current_user_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=current_user_email, role="model", message=full_ai_response))
         
-        if not user.is_premium:
-            user.free_messages_used += 1
-        elif key_used == "master":
+        if key_used == "master":
             user.messages_used += 1
             
         db.commit()
 
-        remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
-        await websocket.send_json({"status": "completed", "key_used": key_used, "remaining_messages": remaining})
+        await websocket.send_json({"status": "completed", "key_used": key_used, "remaining_messages": 99999})
         
     except asyncio.CancelledError:
         await websocket.send_json({"status": "interrupted"})
