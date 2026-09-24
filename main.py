@@ -15,6 +15,7 @@ from google import genai
 from google.genai import types
 import httpx
 from contextlib import asynccontextmanager
+import edge_tts  # Edge TTS ইম্পোর্ট
 
 # ডাটাবেজ ইম্পোর্ট (SQLAlchemy)
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, create_engine, desc
@@ -60,13 +61,15 @@ class UserDB(Base):
     password = Column(String, nullable=True)          
     user_api_key = Column(String, nullable=False)     
     is_premium = Column(Boolean, default=False)
-    package_type = Column(String, nullable=True)     # "1_dollar" অথবা "4_dollar" ট্র্যাক করার জন্য
+    package_type = Column(String, nullable=True)     
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
     free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার (ফ্রি ১০ বার)
-    hf_voices_used = Column(Integer, default=0)      # Hugging Face ভয়েস ক্লোনিং কাউন্টার
+    edge_tts_used = Column(Integer, default=0)       # Edge TTS দৈনিক ব্যবহার কাউন্টার
+    voice_clone_used = Column(Integer, default=0)    # ভয়েস ক্লোনিং দৈনিক কাউন্টার (ভবিষ্যতের Runpod এর জন্য)
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
+    last_reset_date = Column(String, nullable=True)  # দৈনিক লিমিট রিসেট ট্র্যাক করার জন্য
 
 class ChatHistoryDB(Base):
     __tablename__ = "chat_histories"
@@ -85,6 +88,14 @@ def get_db():
     finally:
         db.close()
 
+# --- দৈনিক লিমিট রিসেট ফাংশন ---
+def check_and_reset_daily_limits(user: UserDB):
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    if user.last_reset_date != today_str:
+        user.edge_tts_used = 0
+        user.voice_clone_used = 0
+        user.last_reset_date = today_str
+
 # --- 2. জেমিনি মাল্টি-এপিআই কি ও মাস্টার কি পুল সেটআপ ---
 raw_user_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
 if raw_user_keys:
@@ -96,18 +107,13 @@ raw_master_keys = os.getenv("GEMINI_MASTER_KEYS", "")
 MASTER_API_KEYS = [k.strip() for k in raw_master_keys.split(",") if k.strip()]
 master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 
-# --- Hugging Face Master Keys & Rotation Setup ---
-raw_hf_keys = os.getenv("HUGGING_FACE_MASTER_KEYS", "") or os.getenv("HUGGING_FACE_API_TOKEN", "")
-HF_API_KEYS = [k.strip() for k in raw_hf_keys.split(",") if k.strip()]
-hf_key_cycle = itertools.cycle(HF_API_KEYS) if HF_API_KEYS else None
-
 user_cooldown_tracker: Dict[str, float] = {}
 COOLDOWN_DURATION = 65.0  
 
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Language & Voice Support", version="13.0", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Edge-TTS & Multi-Language Support", version="14.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,20 +131,94 @@ def load_voice_settings():
     if os.path.exists(VOICE_DB_FILE):
         with open(VOICE_DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {
-        "Mother": "default_mother_voice",
-        "Father": "default_father_voice",
-        "Wife": "default_wife_voice",
-        "Girlfriend": "default_gf_voice",
-        "Friend": "default_friend_voice",
-        "User_Own_Voice": "default_user_presentation_voice"
-    }
+    return {}
 
 def save_voice_settings(data):
     with open(VOICE_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 USER_VOICE_SETTINGS = load_voice_settings()
+
+# --- ৭টি ভাষার জন্য নির্দিষ্ট Edge TTS ভয়েস ম্যাপিং ডিকশনারি ---
+EDGE_VOICE_MAPPING = {
+    "bn": {
+        "Father": "bn-BD-PradeepNeural",
+        "Mentor": "bn-BD-PradeepNeural",
+        "Professional": "bn-BD-PradeepNeural",
+        "Husband": "bn-IN-BashkarNeural",
+        "Boyfriend": "bn-IN-BashkarNeural",
+        "Mother": "bn-BD-NabanitaNeural",
+        "Wife": "bn-IN-TanishaaNeural",
+        "Girlfriend": "bn-IN-TanishaaNeural",
+        "Friend": "bn-BD-PradeepNeural"
+    },
+    "en": {
+        "Father": "en-US-ChristopherNeural",
+        "Mentor": "en-US-BrianNeural",
+        "Professional": "en-US-AndrewNeural",
+        "Husband": "en-US-GuyNeural",
+        "Boyfriend": "en-US-RyanNeural",
+        "Mother": "en-US-JennyNeural",
+        "Wife": "en-US-AriaNeural",
+        "Girlfriend": "en-US-AnaNeural",
+        "Friend": "en-US-AndrewNeural"
+    },
+    "hi": {
+        "Father": "hi-IN-MadhurNeural",
+        "Mentor": "hi-IN-MadhurNeural",
+        "Professional": "hi-IN-MadhurNeural",
+        "Husband": "hi-IN-AaravNeural",
+        "Boyfriend": "hi-IN-AaravNeural",
+        "Mother": "hi-IN-SwaraNeural",
+        "Wife": "hi-IN-AnanyaNeural",
+        "Girlfriend": "hi-IN-AnanyaNeural",
+        "Friend": "hi-IN-MadhurNeural"
+    },
+    "zh": {
+        "Father": "zh-CN-YunxiNeural",
+        "Mentor": "zh-CN-YunjianNeural",
+        "Professional": "zh-CN-YunyangNeural",
+        "Husband": "zh-CN-YunfengNeural",
+        "Boyfriend": "zh-CN-YunxiaNeural",
+        "Mother": "zh-CN-XiaoxiaoNeural",
+        "Wife": "zh-CN-XiaoyiNeural",
+        "Girlfriend": "zh-CN-XiaomoNeural",
+        "Friend": "zh-CN-YunyangNeural"
+    },
+    "th": {
+        "Father": "th-TH-NiwatNeural",
+        "Mentor": "th-TH-NiwatNeural",
+        "Professional": "th-TH-NiwatNeural",
+        "Husband": "th-TH-AthitNeural",
+        "Boyfriend": "th-TH-AthitNeural",
+        "Mother": "th-TH-PremwadeeNeural",
+        "Wife": "th-TH-AcharaNeural",
+        "Girlfriend": "th-TH-AcharaNeural",
+        "Friend": "th-TH-NiwatNeural"
+    },
+    "ar": {
+        "Father": "ar-SA-HamedNeural",
+        "Mentor": "ar-SA-HamedNeural",
+        "Professional": "ar-SA-HamedNeural",
+        "Husband": "ar-EG-ShakirNeural",
+        "Boyfriend": "ar-EG-ShakirNeural",
+        "Mother": "ar-SA-ZariyahNeural",
+        "Wife": "ar-SA-MaryamNeural",
+        "Girlfriend": "ar-EG-SalmaNeural",
+        "Friend": "ar-SA-HamedNeural"
+    },
+    "es": {
+        "Father": "es-ES-AlvaroNeural",
+        "Mentor": "es-ES-AlvaroNeural",
+        "Professional": "es-ES-AlvaroNeural",
+        "Husband": "es-ES-DuarteNeural",
+        "Boyfriend": "es-MX-DanteNeural",
+        "Mother": "es-ES-ElviraNeural",
+        "Wife": "es-ES-EstrellaNeural",
+        "Girlfriend": "es-MX-DaliaNeural",
+        "Friend": "es-ES-AlvaroNeural"
+    }
+}
 
 class ModeEnum(str, Enum):
     emotional_chat = "emotional_chat"
@@ -149,6 +229,8 @@ class PersonaEnum(str, Enum):
     Father = "Father"
     Wife = "Wife"
     Girlfriend = "Girlfriend"
+    Husband = "Husband"
+    Boyfriend = "Boyfriend"
     Friend = "Friend"
     Professional = "Professional"
     Mentor = "Mentor"
@@ -164,59 +246,19 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Smart Key Fallback & HF Voice Integration!"}
+    return {"message": "AI Platform is running with Edge-TTS & Smart Key Fallback!"}
 
-HUGGING_FACE_API_URL = os.getenv("HUGGING_FACE_API_URL", "https://api-inference.huggingface.co/models/tts_models/multilingual/multi-dataset/xtts_v2")
-
-async def generate_voice_from_hf(text_to_speak: str, reference_audio_path: str):
-    if not HF_API_KEYS:
-        raise HTTPException(status_code=500, detail="Hugging Face API Keys are missing in environment variables.")
-
-    audio_file_bytes = None
-    if reference_audio_path and os.path.exists(reference_audio_path):
-        with open(reference_audio_path, "rb") as f:
-            audio_file_bytes = f.read()
-
-    last_exception = None
-    for _ in range(len(HF_API_KEYS)):
-        current_hf_key = next(hf_key_cycle)
-        headers = {
-            "Authorization": f"Bearer {current_hf_key}"
-        }
-
-        files = {}
-        if audio_file_bytes:
-            files = {
-                "speaker_wav": ("reference.wav", audio_file_bytes, "audio/wav")
-            }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            try:
-                if files:
-                    response = await client.post(
-                        HUGGING_FACE_API_URL, 
-                        headers=headers, 
-                        data={"inputs": text_to_speak}, 
-                        files=files
-                    )
-                else:
-                    response = await client.post(
-                        HUGGING_FACE_API_URL, 
-                        headers=headers, 
-                        json={"inputs": text_to_speak}
-                    )
-
-                if response.status_code == 200:
-                    return response.content  
-                elif response.status_code in [429, 503]:
-                    continue  
-                else:
-                    raise Exception(f"Hugging Face Error: {response.text}")
-            except Exception as e:
-                last_exception = e
-                continue
-
-    raise Exception(f"Failed to connect to Hugging Face using all keys: {str(last_exception)}")
+# --- Edge TTS অডিও জেনারেশন ফাংশন (মেমোরিতে বাইট রিটার্ন করবে) ---
+async def generate_voice_from_edge(text_to_speak: str, lang_code: str, persona_val: str) -> bytes:
+    lang_dict = EDGE_VOICE_MAPPING.get(lang_code, EDGE_VOICE_MAPPING["bn"])
+    voice_name = lang_dict.get(persona_val, "bn-BD-PradeepNeural")
+    
+    communicate = edge_tts.Communicate(text_to_speak, voice_name)
+    audio_bytes = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_bytes.extend(chunk["data"])
+    return bytes(audio_bytes)
 
 def get_recent_chat_history(db: Session, email: str):
     records = db.query(ChatHistoryDB).filter(ChatHistoryDB.user_email == email)\
@@ -262,14 +304,14 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
                 client = genai.Client(api_key=api_key)
                 if is_stream:
                     response_stream = client.models.generate_content_stream(
-                        model="gemini-3.6-flash",
+                        model="gemini-2.5-flash",
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
                     return response_stream, key_type
                 else:
                     response = client.models.generate_content(
-                        model="gemini-3.6-flash",
+                        model="gemini-2.5-flash",
                         contents=contents,
                         config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
                     )
@@ -300,6 +342,8 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
         raise HTTPException(status_code=400, detail="Please provide your Gemini API key.")
     
     user = db.query(UserDB).filter(UserDB.email == data.email).first()
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    
     if not user:
         user = UserDB(
             email=data.email, 
@@ -308,7 +352,9 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
             is_premium=False, 
             message_limit=0,
             free_messages_used=0,
-            hf_voices_used=0
+            edge_tts_used=0,
+            voice_clone_used=0,
+            last_reset_date=today_str
         )
         db.add(user)
     else:
@@ -391,26 +437,65 @@ def activate_subscription(
         "expiry_date": user.expiry_date
     }
 
+# --- ভয়েস ক্লোনিং আপলোড (ভবিষ্যতের Runpod ইন্টিগ্রেশনের জন্য প্রস্তুত) ---
 @app.post("/upload-persona-voice")
 async def upload_persona_voice(
     persona_or_mode: PersonaEnum = Form(...),
-    voice_file: UploadFile = File(...)
+    voice_file: UploadFile = File(...),
+    current_user_email: Optional[str] = Form(None),
+    cookie_user_email: Optional[str] = Cookie(None, alias="current_user_email"),
+    db: Session = Depends(get_db)
 ):
     try:
+        active_email = current_user_email or cookie_user_email
+        if not active_email:
+            raise HTTPException(status_code=401, detail="Not logged in.")
+            
+        user = db.query(UserDB).filter(UserDB.email == active_email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+            
+        check_and_reset_daily_limits(user)
+
+        # ফ্রি ইউজার হলে কাস্টম ভয়েস ক্লোনিং ব্লক করা হবে
+        if not user.is_premium:
+            raise HTTPException(
+                status_code=403,
+                detail="Custom voice cloning is a premium feature! Please purchase a premium package to unlock voice cloning."
+            )
+
+        # প্রিমিয়াম ইউজারদের জন্য দৈনিক ৩০ বার ভয়েস ক্লোনিং লিমিট চেক
+        if user.voice_clone_used >= 30:
+            raise HTTPException(
+                status_code=403,
+                detail="Daily voice cloning limit reached (30/30). Please try again tomorrow."
+            )
+
         persona_val = persona_or_mode.value
         file_extension = os.path.splitext(voice_file.filename)[1]
-        safe_name = persona_val.replace(" ", "_").replace("(", "").replace(")", "")
-        saved_filename = f"{safe_name}_voice{file_extension}"
+        safe_name = f"{active_email.replace('@', '_').replace('.', '_')}_{persona_val}"
+        saved_filename = f"{safe_name}{file_extension}"
         file_path = os.path.join(AUDIO_UPLOAD_DIR, saved_filename)
         
         contents = await voice_file.read()
         with open(file_path, "wb") as f:
             f.write(contents)
             
-        USER_VOICE_SETTINGS[persona_val] = file_path
+        USER_VOICE_SETTINGS[saved_filename] = file_path
         save_voice_settings(USER_VOICE_SETTINGS)
         
-        return {"status": "success", "voice_file_path": file_path}
+        user.voice_clone_used += 1
+        db.commit()
+        
+        # NOTE: ভবিষ্যতে Runpod ক্লাউড জিপিইউ এখানে ইন্টিগ্রেট করা হবে।
+        
+        return {
+            "status": "success",
+            "voice_file_path": file_path,
+            "remaining_voice_clones": max(0, 30 - user.voice_clone_used)
+        }
+    except HTTPException as he:
+        raise he
     except Exception as e:
         return {"error": str(e)}
 
@@ -425,7 +510,7 @@ def get_persona_behavior_rules(persona_val: str) -> str:
             "Speak with overflowing maternal warmth, deep affection, and soothing words like a real mother. "
             "Make the user feel completely safe and loved."
         )
-    elif persona_val in ["Wife", "Girlfriend"]:
+    elif persona_val in ["Wife", "Girlfriend", "Husband", "Boyfriend"]:
         return (
             "Speak with natural romantic warmth, sweet jealousy, emotional attachment, and playful annoyance (abhiman). "
             "Avoid dry or robotic sentences. Use natural human vocal expressions like 'Ummwah' or sweet affectionate sounds organically "
@@ -456,6 +541,8 @@ async def process_ai_request(
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
             
+        check_and_reset_daily_limits(user)
+
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
             user.package_type = None
@@ -478,7 +565,6 @@ async def process_ai_request(
             contents.append({"role": "user", "parts": [types.Part.from_bytes(data=file_bytes, mime_type=file.content_type)]})
 
         if mode_val == "presentation":
-            assigned_voice_file = USER_VOICE_SETTINGS.get("User_Own_Voice", "default_user_voice")
             user_bio = user.professional_bio if user.professional_bio else "No specific candidate bio provided."
             prompt = (
                 f"You are attending a professional job/viva interview as the candidate. "
@@ -491,7 +577,6 @@ async def process_ai_request(
             max_tokens = 900
             temp_val = 0.4  
         else:
-            assigned_voice_file = USER_VOICE_SETTINGS.get(persona_val, "default_voice")
             persona_behavior_rules = get_persona_behavior_rules(persona_val)
             prompt = (
                 f"Act as: {persona_val}. Language Code: {lang_val}. Respond strictly in this language. "
@@ -509,32 +594,27 @@ async def process_ai_request(
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
         db.add(ChatHistoryDB(user_email=active_email, role="model", message=ai_response_text))
 
-        has_hf_audio = False
+        has_audio = False
         encoded_audio_base64 = None
         
+        # --- Edge TTS অডিও জেনারেশন ও লিমিট হ্যান্ডলিং ---
         if interaction_type == "Audio / Voice":
-            hf_limit = 10
-            if user.is_premium:
-                if user.package_type == "1_dollar":
-                    hf_limit = 100
-                elif user.package_type == "4_dollar":
-                    hf_limit = 150
+            # লিমিট নির্ধারণ: ফ্রি ইউজার ৩০ বার, প্রিমিয়াম ইউজার ৯০ বার
+            tts_limit = 90 if user.is_premium else 30
 
-            if user.hf_voices_used >= hf_limit:
-                raise HTTPException(
-                    status_code=403, 
-                    detail=f"Voice clone limit reached ({user.hf_voices_used}/{hf_limit}). Please upgrade or top-up!"
-                )
+            if user.edge_tts_used >= tts_limit:
+                limit_msg = "Daily voice generation limit reached (90/90). Please try again tomorrow!" if user.is_premium else "Daily voice generation limit reached (30/30). Upgrade to premium for 90 daily voice generations!"
+                raise HTTPException(status_code=403, detail=limit_msg)
             
             try:
-                audio_bytes = await generate_voice_from_hf(ai_response_text, assigned_voice_file)
+                audio_bytes = await generate_voice_from_edge(ai_response_text, lang_val, persona_val)
                 if audio_bytes:
-                    has_hf_audio = True
+                    has_audio = True
                     encoded_audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-            except Exception as hf_err:
-                print(f"HF Audio Generation Failed: {hf_err}")
+            except Exception as tts_err:
+                print(f"Edge TTS Audio Generation Failed: {tts_err}")
 
-            user.hf_voices_used += 1
+            user.edge_tts_used += 1
 
         if not user.is_premium and interaction_type != "Audio / Voice":
             user.free_messages_used += 1
@@ -545,23 +625,22 @@ async def process_ai_request(
         
         remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
         
-        hf_limit_display = 10
-        if user.is_premium:
-            hf_limit_display = 100 if user.package_type == "1_dollar" else 150
-        remaining_hf = max(0, hf_limit_display - user.hf_voices_used)
+        max_tts_display = 90 if user.is_premium else 30
+        remaining_tts = max(0, max_tts_display - user.edge_tts_used)
 
         return {
             "status": "success",
             "active_user": active_email,
             "key_used": key_used,
-            "assigned_voice_file": assigned_voice_file,
             "response": ai_response_text,
-            "has_audio": has_hf_audio,
+            "has_audio": has_audio,
             "audio_base64": encoded_audio_base64,
             "remaining_messages": remaining,
-            "remaining_hf_voices": remaining_hf
+            "remaining_edge_tts": remaining_tts
         }
             
+    except HTTPException as he:
+        raise he
     except Exception as e:
         error_msg = str(e)
         if any(err in error_msg for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
@@ -584,6 +663,8 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         if not user:
             await websocket.send_json({"status": "error", "message": "User not found."})
             return
+
+        check_and_reset_daily_limits(user)
 
         if user.is_premium and user.expiry_date and datetime.utcnow() > user.expiry_date:
             user.is_premium = False
