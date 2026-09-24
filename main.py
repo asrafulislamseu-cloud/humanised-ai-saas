@@ -65,8 +65,8 @@ class UserDB(Base):
     message_limit = Column(Integer, default=0)       
     messages_used = Column(Integer, default=0)       
     free_messages_used = Column(Integer, default=0)  # জেমিনি টেক্সট চ্যাট কাউন্টার (ফ্রি ১০ বার)
-    edge_tts_used = Column(Integer, default=0)       # Edge TTS দৈনিক ব্যবহার কাউন্টার
-    voice_clone_used = Column(Integer, default=0)    # ভয়েস ক্লোনিং দৈনিক কাউন্টার (ভবিষ্যতের Runpod এর জন্য)
+    edge_tts_used = Column(Integer, default=0)       # Edge TTS দৈনিক ব্যবহার কাউন্টার (সম্পূর্ণ আলাদা)
+    voice_clone_used = Column(Integer, default=0)    # ভয়েস ক্লোনিং দৈনিক কাউন্টার
     expiry_date = Column(DateTime, nullable=True)    
     professional_bio = Column(Text, nullable=True)   
     last_reset_date = Column(String, nullable=True)  # দৈনিক লিমিট রিসেট ট্র্যাক করার জন্য
@@ -96,6 +96,9 @@ def check_and_reset_daily_limits(user: UserDB):
         user.voice_clone_used = 0
         user.last_reset_date = today_str
 
+# --- একই ইউজারের ডাবল রিকোয়েস্ট বা কনকারেন্ট হিট আটকানোর জন্য একটিভ রিকোয়েস্ট ট্র্যাকার ---
+active_processing_users = set()
+
 # --- 2. জেমিনি মাল্টি-এপিআই কি ও মাস্টার কি পুল সেটআপ ---
 raw_user_keys = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY")
 if raw_user_keys:
@@ -113,7 +116,7 @@ COOLDOWN_DURATION = 65.0
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Edge-TTS & Multi-Language Support", version="14.0", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Edge-TTS & Smart Key Fallback", version="14.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -246,9 +249,9 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Edge-TTS & Smart Key Fallback!"}
+    return {"message": "AI Platform is running with independent Edge-TTS & Smart Key Fallback!"}
 
-# --- Edge TTS অডিও জেনারেশন ফাংশন (মেমোরিতে বাইট রিটার্ন করবে) ---
+# --- Edge TTS অডিও জেনারেশন ফাংশন ---
 async def generate_voice_from_edge(text_to_speak: str, lang_code: str, persona_val: str) -> bytes:
     lang_dict = EDGE_VOICE_MAPPING.get(lang_code, EDGE_VOICE_MAPPING["bn"])
     voice_name = lang_dict.get(persona_val, "bn-BD-PradeepNeural")
@@ -437,7 +440,6 @@ def activate_subscription(
         "expiry_date": user.expiry_date
     }
 
-# --- ভয়েস ক্লোনিং আপলোড (ভবিষ্যতের Runpod ইন্টিগ্রেশনের জন্য প্রস্তুত) ---
 @app.post("/upload-persona-voice")
 async def upload_persona_voice(
     persona_or_mode: PersonaEnum = Form(...),
@@ -457,14 +459,12 @@ async def upload_persona_voice(
             
         check_and_reset_daily_limits(user)
 
-        # ফ্রি ইউজার হলে কাস্টম ভয়েস ক্লোনিং ব্লক করা হবে
         if not user.is_premium:
             raise HTTPException(
                 status_code=403,
                 detail="Custom voice cloning is a premium feature! Please purchase a premium package to unlock voice cloning."
             )
 
-        # প্রিমিয়াম ইউজারদের জন্য দৈনিক ৩০ বার ভয়েস ক্লোনিং লিমিট চেক
         if user.voice_clone_used >= 30:
             raise HTTPException(
                 status_code=403,
@@ -486,8 +486,6 @@ async def upload_persona_voice(
         
         user.voice_clone_used += 1
         db.commit()
-        
-        # NOTE: ভবিষ্যতে Runpod ক্লাউড জিপিইউ এখানে ইন্টিগ্রেট করা হবে।
         
         return {
             "status": "success",
@@ -532,11 +530,19 @@ async def process_ai_request(
     cookie_user_email: Optional[str] = Cookie(None, alias="current_user_email"),
     db: Session = Depends(get_db)
 ):
+    active_email = current_user_email or cookie_user_email
+    if not active_email:
+        raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
+
+    # --- কনকারেন্ট হিট ব্লক করার লজিক ---
+    if active_email in active_processing_users:
+        raise HTTPException(
+            status_code=429, 
+            detail="Previous message is still processing. Please wait for the response."
+        )
+
+    active_processing_users.add(active_email)
     try:
-        active_email = current_user_email or cookie_user_email
-        if not active_email:
-            raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
-            
         user = db.query(UserDB).filter(UserDB.email == active_email).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -548,10 +554,11 @@ async def process_ai_request(
             user.package_type = None
             db.commit()
 
+        # --- সম্পূর্ণ স্বাধীন জেমিনি টেক্সট চ্যাট লিমিট চেক ---
         if not user.is_premium and interaction_type != "Audio / Voice" and user.free_messages_used >= 10:
             raise HTTPException(
                 status_code=403, 
-                detail="Free message limit reached (10/10)! Please purchase a premium package to continue."
+                detail="Free text message limit reached (10/10)! Please purchase a premium package to continue."
             )
 
         mode_val = mode.value
@@ -589,6 +596,7 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
+        # জেমিনি এআই থেকে মাত্র একবার টেক্সট রেসপন্স কল করা হচ্ছে
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
@@ -597,9 +605,8 @@ async def process_ai_request(
         has_audio = False
         encoded_audio_base64 = None
         
-        # --- Edge TTS অডিও জেনারেশন ও লিমিট হ্যান্ডলিং ---
+        # --- সম্পূর্ণ স্বাধীন Edge TTS ভয়েস লিমিট চেক (জেমিনির সাথে এর কোনো সম্পর্ক নেই) ---
         if interaction_type == "Audio / Voice":
-            # লিমিট নির্ধারণ: ফ্রি ইউজার ৩০ বার, প্রিমিয়াম ইউজার ৯০ বার
             tts_limit = 90 if user.is_premium else 30
 
             if user.edge_tts_used >= tts_limit:
@@ -616,6 +623,7 @@ async def process_ai_request(
 
             user.edge_tts_used += 1
 
+        # কাউন্টার আপডেট (টেক্সট চ্যাট বা ভয়েস চ্যাট অনুযায়ী স্বাধীনভাবে বাড়বে)
         if not user.is_premium and interaction_type != "Audio / Voice":
             user.free_messages_used += 1
         elif key_used == "master":
@@ -624,7 +632,6 @@ async def process_ai_request(
         db.commit()
         
         remaining = max(0, user.message_limit - user.messages_used) if user.is_premium else max(0, 10 - user.free_messages_used)
-        
         max_tts_display = 90 if user.is_premium else 30
         remaining_tts = max(0, max_tts_display - user.edge_tts_used)
 
@@ -649,6 +656,9 @@ async def process_ai_request(
             else:
                 return {"error": "Rate limit exceeded! Switched to master key temporarily."}
         return {"error": error_msg}
+    finally:
+        if active_email in active_processing_users:
+            active_processing_users.remove(active_email)
 
 # --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
@@ -672,7 +682,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             db.commit()
 
         if not user.is_premium and user.free_messages_used >= 10:
-            await websocket.send_json({"status": "error", "message": "Free limit reached (10/10). Please purchase a premium package."})
+            await websocket.send_json({"status": "error", "message": "Free text limit reached (10/10). Please purchase a premium package."})
             return
 
         mode = data.get("mode", "emotional_chat")
