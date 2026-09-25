@@ -5,6 +5,8 @@ import time
 import random
 import itertools
 import base64
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -247,12 +249,17 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
             async with ai_semaphore:
                 client = genai.Client(api_key=api_key)
                 if is_stream:
-                    response_stream = client.models.generate_content_stream(
-                        model="gemini-3.6-flash",
-                        contents=contents,
-                        config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
-                    )
-                    return response_stream, key_type
+                    # Async Stream Generator Return
+                    async def stream_generator():
+                        response_stream = await client.aio.models.generate_content_stream(
+                            model="gemini-3.6-flash",
+                            contents=contents,
+                            config=types.GenerateContentConfig(temperature=temp_val, max_output_tokens=max_tokens)
+                        )
+                        async for chunk in response_stream:
+                            yield chunk
+
+                    return stream_generator(), key_type
                 else:
                     response = client.models.generate_content(
                         model="gemini-3.6-flash",
@@ -333,7 +340,6 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
         }
     }
 
-# --- নতুন যুক্ত করা Forgot Password রাউট ---
 class ForgotPasswordRequest(BaseModel):
     email: str
 
@@ -341,10 +347,8 @@ class ForgotPasswordRequest(BaseModel):
 def forgot_password(data: ForgotPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.email == data.email).first()
     if not user:
-        # সিকিউরিটির জন্য ইউজার না থাকলেও সাকসেস মেসেজ রিটার্ন করা ভালো যাতে ইমেইল এক্সিস্ট করে কিনা তা প্রকাশ না পায়
         return {"status": "success", "message": "If this email is registered, password reset instructions have been sent."}
     
-    # এখানে আপনি চাইলে ইমেইল পাঠানোর কোড (SMTP/SendGrid) যুক্ত করতে পারেন।
     return {"status": "success", "message": "Password reset instructions sent to your email."}
 
 @app.post("/logout")
@@ -471,6 +475,26 @@ async def create_paddle_checkout(data: CheckoutRequest, current_user_email: Opti
 async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         body_bytes = await request.body()
+        paddle_signature = request.headers.get("Paddle-Signature", "")
+        # আপনার Environment Variable-এর নামের সাথে মিলিয়ে PADDLE_WEBHOOK_SECRET দেওয়া হলো
+        secret_key = os.getenv("PADDLE_WEBHOOK_SECRET", "")
+
+        # Paddle HMAC Signature যাচাইকরণ (যদি Secret Key দেওয়া থাকে)
+        if secret_key and paddle_signature:
+            ts_str, h1_str = "", ""
+            parts = paddle_signature.split(";")
+            for part in parts:
+                if part.startswith("ts="):
+                    ts_str = part.split("=")[1]
+                elif part.startswith("h1="):
+                    h1_str = part.split("=")[1]
+
+            if ts_str and h1_str:
+                signed_payload = f"{ts_str}:{body_bytes.decode('utf-8')}"
+                computed_hash = hmac.new(secret_key.encode('utf-8'), signed_payload.encode('utf-8'), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(computed_hash, h1_str):
+                    raise HTTPException(status_code=401, detail="Invalid Paddle Webhook Signature.")
+
         event_json = json.loads(body_bytes.decode("utf-8"))
         event_type = event_json.get("event_type")
         data = event_json.get("data", {})
@@ -595,7 +619,8 @@ async def process_ai_request(
 # --- WebSocket লাইভ স্ট্রিম হ্যান্ডলার ---
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
-async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, current_user_email: Optional[str]):
+async def handle_ai_stream(websocket: WebSocket, data: dict, current_user_email: Optional[str]):
+    db = SessionLocal()  # প্রতিটি স্ট্রিম রিকোয়েস্টের জন্য ফ্রেশ সেশন
     try:
         if not current_user_email:
             await websocket.send_json({"status": "error", "message": "Not logged in."})
@@ -619,7 +644,8 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
         response_stream, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val=0.5, max_tokens=800, is_stream=True)
         
         full_ai_response = ""
-        for chunk in response_stream:
+        # Async Iteration যাতে ইভেন্ট লুপ ব্লক না হয়
+        async for chunk in response_stream:
             chunk_text = getattr(chunk, "text", "") or (chunk.candidates[0].content.parts[0].text if chunk.candidates else "")
             if chunk_text:
                 full_ai_response += chunk_text
@@ -634,12 +660,14 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
 
         await websocket.send_json({"status": "completed", "remaining_messages": max(0, user.message_limit - user.messages_used)})
     except Exception as e:
+        db.rollback()
         await websocket.send_json({"status": "error", "message": str(e)})
+    finally:
+        db.close() # ডাটাবেজ সেশন ক্লিনআপ
 
 @app.websocket("/ws/live-ai")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    db = SessionLocal()
     try:
         while True:
             data = await websocket.receive_json()
@@ -648,10 +676,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if websocket in active_tasks and not active_tasks[websocket].done():
                 active_tasks[websocket].cancel()
 
-            task = asyncio.create_task(handle_ai_stream(websocket, data, db, active_email))
+            task = asyncio.create_task(handle_ai_stream(websocket, data, active_email))
             active_tasks[websocket] = task
     except WebSocketDisconnect:
         if websocket in active_tasks and not active_tasks[websocket].done():
             active_tasks[websocket].cancel()
-    finally:
-        db.close()
