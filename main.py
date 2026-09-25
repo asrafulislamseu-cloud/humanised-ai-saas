@@ -249,7 +249,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
             async with ai_semaphore:
                 client = genai.Client(api_key=api_key)
                 if is_stream:
-                    # Async Stream Generator Return
                     async def stream_generator():
                         response_stream = await client.aio.models.generate_content_stream(
                             model="gemini-3.6-flash",
@@ -395,8 +394,10 @@ def update_user_profile(
         
     return {"status": "success", "message": "Profile updated successfully!"}
 
+# --- আপডেট করা SubscriptionActivateRequest ও activate-subscription ---
 class SubscriptionActivateRequest(BaseModel):
     package_type: str
+    email: Optional[str] = None  # ফ্রন্টএন্ড থেকে ইমেল পাঠানোর অপশন যুক্ত করা হলো
 
 @app.post("/activate-subscription")
 def activate_subscription(
@@ -404,10 +405,12 @@ def activate_subscription(
     current_user_email: Optional[str] = Cookie(None), 
     db: Session = Depends(get_db)
 ):
-    if not current_user_email:
+    # কুকি অথবা রিকোয়েস্ট বডি থেকে ইমেল নিশ্চিত করা হলো
+    active_email = current_user_email or data.email
+    if not active_email:
         raise HTTPException(status_code=401, detail="Not logged in.")
         
-    user = db.query(UserDB).filter(UserDB.email == current_user_email).first()
+    user = db.query(UserDB).filter(UserDB.email == active_email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
         
@@ -476,10 +479,8 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         body_bytes = await request.body()
         paddle_signature = request.headers.get("Paddle-Signature", "")
-        # আপনার Environment Variable-এর নামের সাথে মিলিয়ে PADDLE_WEBHOOK_SECRET দেওয়া হলো
         secret_key = os.getenv("PADDLE_WEBHOOK_SECRET", "")
 
-        # Paddle HMAC Signature যাচাইকরণ (যদি Secret Key দেওয়া থাকে)
         if secret_key and paddle_signature:
             ts_str, h1_str = "", ""
             parts = paddle_signature.split(";")
@@ -575,10 +576,10 @@ async def process_ai_request(
         if mode_val == "presentation":
             user_bio = user.professional_bio if user.professional_bio else "No bio provided."
             prompt = f"Candidate Profile: {user_bio}. Language: {lang_val}. Topic: {slide_content}. Question: {user_message}. Give a direct, professional answer."
-            max_tokens, temp_val = 800, 0.4  
+            max_tokens, temp_val = 900, 0.4  
         else:
             prompt = f"Act as: {persona_val}. Language: {lang_val}. Guidelines: {get_persona_behavior_rules(persona_val)} User Message: {user_message}."
-            max_tokens, temp_val = 600, 0.5  
+            max_tokens, temp_val = 800, 0.5  
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
@@ -620,7 +621,7 @@ async def process_ai_request(
 active_tasks: Dict[WebSocket, asyncio.Task] = {}
 
 async def handle_ai_stream(websocket: WebSocket, data: dict, current_user_email: Optional[str]):
-    db = SessionLocal()  # প্রতিটি স্ট্রিম রিকোয়েস্টের জন্য ফ্রেশ সেশন
+    db = SessionLocal()  
     try:
         if not current_user_email:
             await websocket.send_json({"status": "error", "message": "Not logged in."})
@@ -644,7 +645,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, current_user_email:
         response_stream, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val=0.5, max_tokens=800, is_stream=True)
         
         full_ai_response = ""
-        # Async Iteration যাতে ইভেন্ট লুপ ব্লক না হয়
         async for chunk in response_stream:
             chunk_text = getattr(chunk, "text", "") or (chunk.candidates[0].content.parts[0].text if chunk.candidates else "")
             if chunk_text:
@@ -663,7 +663,7 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, current_user_email:
         db.rollback()
         await websocket.send_json({"status": "error", "message": str(e)})
     finally:
-        db.close() # ডাটাবেজ সেশন ক্লিনআপ
+        db.close() 
 
 @app.websocket("/ws/live-ai")
 async def websocket_endpoint(websocket: WebSocket):
