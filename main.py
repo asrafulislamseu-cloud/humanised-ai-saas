@@ -834,7 +834,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 active_tasks[websocket].cancel()
                 try:
                     await active_tasks[websocket]
-                except asyncio.CancelledOpper:
+                except asyncio.CancelledError:
                     pass
 
             task = asyncio.create_task(handle_ai_stream(websocket, data, db, active_email))
