@@ -575,10 +575,10 @@ async def process_ai_request(
         if mode_val == "presentation":
             user_bio = user.professional_bio if user.professional_bio else "No bio provided."
             prompt = f"Candidate Profile: {user_bio}. Language: {lang_val}. Topic: {slide_content}. Question: {user_message}. Give a direct, professional answer."
-            max_tokens, temp_val = 900, 0.4  
+            max_tokens, temp_val = 800, 0.4  
         else:
             prompt = f"Act as: {persona_val}. Language: {lang_val}. Guidelines: {get_persona_behavior_rules(persona_val)} User Message: {user_message}."
-            max_tokens, temp_val = 800, 0.5  
+            max_tokens, temp_val = 600, 0.5  
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
