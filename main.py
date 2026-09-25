@@ -6,7 +6,7 @@ import random
 import itertools
 import base64
 from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Depends, HTTPException, Response, Cookie, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict
 from enum import Enum
@@ -440,6 +440,52 @@ def activate_subscription(
         "expiry_date": user.expiry_date
     }
 
+# --- প্যাডেল (Paddle) পেমেন্ট অটোমেশন ওয়েব হুক এন্ডপয়েন্ট ---
+@app.post("/paddle-webhook")
+async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
+    try:
+        body_bytes = await request.body()
+        event_json = json.loads(body_bytes.decode("utf-8"))
+        
+        event_type = event_json.get("event_type")
+        data = event_json.get("data", {})
+        
+        # পেমেন্ট সফল বা সাবস্ক্রিপশন অ্যাক্টিভ হলে ইউজারের লিমিট আপডেট করা
+        if event_type in ["transaction.completed", "subscription.created", "subscription.activated"]:
+            customer_email = data.get("customer", {}).get("email") or data.get("custom_data", {}).get("email")
+            
+            if customer_email:
+                user = db.query(UserDB).filter(UserDB.email == customer_email).first()
+                if user:
+                    items = data.get("items", [])
+                    added_limit = 2500  # ডিফল্ট ১ ডলার প্যাকেজ লিমিট
+                    package_name = "1_dollar"
+                    
+                    for item in items:
+                        product = item.get("product", {})
+                        if "4" in str(product.get("name", "")):
+                            added_limit = 12000
+                            package_name = "4_dollar"
+                    
+                    now = datetime.utcnow()
+                    if user.is_premium and user.expiry_date and user.expiry_date > now:
+                        user.message_limit += added_limit
+                        user.expiry_date = user.expiry_date + timedelta(days=30)
+                    else:
+                        user.message_limit = added_limit
+                        user.messages_used = 0
+                        user.expiry_date = now + timedelta(days=30)
+                    
+                    user.is_premium = True
+                    user.package_type = package_name
+                    db.commit()
+                    print(f"Paddle Webhook: Subscription activated successfully for {customer_email}")
+                    
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Paddle Webhook error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/upload-persona-voice")
 async def upload_persona_voice(
     persona_or_mode: PersonaEnum = Form(...),
@@ -459,7 +505,6 @@ async def upload_persona_voice(
             
         check_and_reset_daily_limits(user)
 
-        # ভয়েস ক্লোনিং এর প্রিমিয়াম ও দৈনিক লিমিট চেক সম্পূর্ণ তুলে দেওয়া হলো
         persona_val = persona_or_mode.value
         file_extension = os.path.splitext(voice_file.filename)[1]
         safe_name = f"{active_email.replace('@', '_').replace('.', '_')}_{persona_val}"
@@ -523,7 +568,6 @@ async def process_ai_request(
     if not active_email:
         raise HTTPException(status_code=401, detail="Not logged in. Please use /register-or-login first.")
 
-    # --- কনকারেন্ট হিট ব্লক করার লজিক ---
     if active_email in active_processing_users:
         raise HTTPException(
             status_code=429, 
@@ -542,8 +586,6 @@ async def process_ai_request(
             user.is_premium = False
             user.package_type = None
             db.commit()
-
-        # টেক্সট চ্যাট এবং ভয়েস চ্যাটের সব ধরনের লিমিট চেক এখানে রিমুভ করা হয়েছে
 
         mode_val = mode.value
         persona_val = persona.value if persona else "Mother"
@@ -588,7 +630,6 @@ async def process_ai_request(
         has_audio = False
         encoded_audio_base64 = None
         
-        # --- অডিও মোডের লিমিট রিমুভ করা হয়েছে ---
         if interaction_type == "Audio / Voice":
             try:
                 audio_bytes = await generate_voice_from_edge(ai_response_text, lang_val, persona_val)
@@ -653,8 +694,6 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             user.is_premium = False
             user.package_type = None
             db.commit()
-
-        # WebSocket এর ফ্রি লিমিট চেক রিমুভ করা হলো
 
         mode = data.get("mode", "emotional_chat")
         persona = data.get("persona", "Mother")
