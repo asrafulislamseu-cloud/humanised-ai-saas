@@ -440,6 +440,60 @@ def activate_subscription(
         "expiry_date": user.expiry_date
     }
 
+# --- ফ্লাটার অ্যাপের জন্য প্যাডেল চেকআউট লিংক জেনারেটর এন্ডপয়েন্ট ---
+class CheckoutRequest(BaseModel):
+    package_type: str
+    user_email: Optional[str] = None
+
+@app.post("/create-paddle-checkout")
+async def create_paddle_checkout(
+    data: CheckoutRequest,
+    current_user_email: Optional[str] = Cookie(None)
+):
+    try:
+        user_email = data.user_email or current_user_email
+        if not user_email:
+            raise HTTPException(status_code=400, detail="User email is required for checkout.")
+
+        price_id_1_dollar = os.getenv("PADDLE_PRICE_ID_1_DOLLAR", "pri_01h...") 
+        price_id_4_dollar = os.getenv("PADDLE_PRICE_ID_4_DOLLAR", "pri_01h...")
+        
+        selected_price_id = price_id_1_dollar if data.package_type == "1_dollar" else price_id_4_dollar
+
+        async with httpx.AsyncClient() as client:
+            paddle_response = await client.post(
+                "https://api.paddle.com/transactions",
+                headers={
+                    "Authorization": f"Bearer {os.getenv('PADDLE_API_KEY')}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "items": [
+                        {
+                            "price_id": selected_price_id,
+                            "quantity": 1
+                        }
+                    ],
+                    "customer": {
+                        "email": user_email
+                    },
+                    "custom_data": {
+                        "email": user_email,
+                        "package_type": data.package_type
+                    }
+                }
+            )
+            
+            if paddle_response.status_code in [200, 201]:
+                res_data = paddle_response.json()
+                checkout_url = res_data.get("data", {}).get("checkout", {}).get("url")
+                return {"status": "success", "checkout_url": checkout_url}
+            else:
+                raise HTTPException(status_code=400, detail=f"Paddle Error: {paddle_response.text}")
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- প্যাডেল (Paddle) পেমেন্ট অটোমেশন ওয়েব হুক এন্ডপয়েন্ট ---
 @app.post("/paddle-webhook")
 async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
@@ -450,7 +504,6 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
         event_type = event_json.get("event_type")
         data = event_json.get("data", {})
         
-        # পেমেন্ট সফল বা সাবস্ক্রিপশন অ্যাক্টিভ হলে ইউজারের লিমিট আপডেট করা
         if event_type in ["transaction.completed", "subscription.created", "subscription.activated"]:
             customer_email = data.get("customer", {}).get("email") or data.get("custom_data", {}).get("email")
             
@@ -458,7 +511,7 @@ async def paddle_webhook(request: Request, db: Session = Depends(get_db)):
                 user = db.query(UserDB).filter(UserDB.email == customer_email).first()
                 if user:
                     items = data.get("items", [])
-                    added_limit = 2500  # ডিফল্ট ১ ডলার প্যাকেজ লিমিট
+                    added_limit = 2500  
                     package_name = "1_dollar"
                     
                     for item in items:
@@ -781,7 +834,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 active_tasks[websocket].cancel()
                 try:
                     await active_tasks[websocket]
-                except asyncio.CancelledError:
+                except asyncio.CancelledOpper:
                     pass
 
             task = asyncio.create_task(handle_ai_stream(websocket, data, db, active_email))
