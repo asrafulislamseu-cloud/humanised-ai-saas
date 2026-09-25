@@ -1,4 +1,4 @@
-import os
+Import os
 import json
 import asyncio
 import time
@@ -467,11 +467,14 @@ async def create_paddle_checkout(data: CheckoutRequest, current_user_email: Opti
             
             if paddle_response.status_code in [200, 201]:
                 res_data = paddle_response.json()
-                # সেফ চেকআউট ইউআরএল এক্সট্রাকশন (যাতে আগের 500 এরর না আসে)
+                print("Paddle Raw Response:", res_data) # লগ দেখার জন্য প্রিন্ট
+                
                 checkout_url = (
                     res_data.get("data", {}).get("url") or 
                     res_data.get("data", {}).get("checkout", {}).get("url")
                 )
+                
+                print("Extracted Checkout URL:", checkout_url) # এক্সট্রাক্ট করা ইউআরএল প্রিন্ট
                 
                 if not checkout_url:
                     raise HTTPException(status_code=400, detail=f"Checkout URL not found in Paddle response: {res_data}")
