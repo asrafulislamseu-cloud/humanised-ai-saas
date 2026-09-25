@@ -218,7 +218,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
     current_time = time.time()
     user_email = user.email
     
-    # ইউজার কুলডাউন চেক (৬৫ সেকেন্ড পার হলে স্বয়ংক্রিয়ভাবে মুছে যাবে)
     is_user_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
@@ -228,18 +227,15 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     keys_to_try = []
 
-    # ১. ইউজার কুলডাউনে না থাকলে নিজের কি দিয়ে চেষ্টা করবে
     if not is_user_in_cooldown and user.user_api_key:
         keys_to_try.append(("user", user.user_api_key))
     
-    # ২. প্রিমিয়াম ইউজার হলে এবং মাস্টার কি লিমিট থাকলে মাস্টার কি যোগ হবে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
 
-    # ৩. ফ্রি ইউজার যদি কুলডাউনে থাকে, সাথে সাথে নির্দিষ্ট ম্যাসেজ দেখাবে
     if not user.is_premium and is_user_in_cooldown:
-        raise Exception("Hold up 65 second or buy a top up package")
+        raise HTTPException(status_code=429, detail="Hold up 65 second or buy a top up package")
 
     last_exception = None
     
@@ -272,19 +268,20 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
-            # নিজের কি দিয়ে রিকোয়েস্ট করার সময় জেমিনি লিমিট এরর (429 ইত্যাদি) খেলে কুলডাউন স্টার্ট হবে
-            if key_type == "user":
-                if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
+            # গুগল এআই সার্ভার ডাউন বা ওভারলোডেড থাকলে (503 বা 429) ক্র্যাশ না করে হ্যান্ডেল করবে
+            if any(err in error_str for err in ["429", "503", "ResourceExhausted", "Quota", "ServiceUnavailable"]):
+                if key_type == "user":
                     user_cooldown_tracker[user_email] = time.time()
             continue
 
     if not user.is_premium and is_user_in_cooldown:
-        raise Exception("Hold up 65 second or buy a top up package")
+        raise HTTPException(status_code=429, detail="Hold up 65 second or buy a top up package")
         
-    if last_exception:
-        raise last_exception
-    else:
-        raise Exception("Failed to generate response from Gemini API.")
+    # গুগল এআই থেকে ৫৬৩/৫৩ বা অন্য কোনো সার্ভার এরর আসলেও সার্ভার ক্র্যাশ (520) না করিয়ে সুন্দর মেসেজ থ্রো করবে
+    raise HTTPException(
+        status_code=503, 
+        detail="Google AI is currently experiencing high demand (503 Service Unavailable). Please try again in a moment."
+    )
 
 class UserRegisterRequest(BaseModel):
     email: str
@@ -318,11 +315,10 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
     
     db.commit()
     
-    # কুকির মেয়াদ ৯৯ দিন করা হলো
     response.set_cookie(
         key="current_user_email",
         value=user.email,
-        max_age=99 * 24 * 60 * 60, # ৯৯ দিন সেশন সেভ থাকবে
+        max_age=99 * 24 * 60 * 60,
         httponly=True,
         samesite="lax"
     )
@@ -599,7 +595,9 @@ async def handle_ai_stream(websocket: WebSocket, data: dict, db: Session, curren
             return
 
         check_and_reset_daily_limits(user, db)
-        mode, persona, target_language, user_message = data.get("mode", "emotional_chat"), data.get("persona", "Mother"), data.get("target_language", "bn"), data.get("user_message", "")
+        persona = data.get("persona", "Mother")
+        target_language = data.get("target_language", "bn")
+        user_message = data.get("user_message", "")
         
         contents = get_recent_chat_history(db, current_user_email)
         prompt = f"Act as: {persona}. Language: {target_language}. User Message: {user_message}."
