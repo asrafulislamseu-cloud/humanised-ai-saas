@@ -394,10 +394,9 @@ def update_user_profile(
         
     return {"status": "success", "message": "Profile updated successfully!"}
 
-# --- আপডেট করা SubscriptionActivateRequest ও activate-subscription ---
 class SubscriptionActivateRequest(BaseModel):
     package_type: str
-    email: Optional[str] = None  # ফ্রন্টএন্ড থেকে ইমেল পাঠানোর অপশন যুক্ত করা হলো
+    email: Optional[str] = None
 
 @app.post("/activate-subscription")
 def activate_subscription(
@@ -405,7 +404,6 @@ def activate_subscription(
     current_user_email: Optional[str] = Cookie(None), 
     db: Session = Depends(get_db)
 ):
-    # কুকি অথবা রিকোয়েস্ট বডি থেকে ইমেল নিশ্চিত করা হলো
     active_email = current_user_email or data.email
     if not active_email:
         raise HTTPException(status_code=401, detail="Not logged in.")
@@ -466,11 +464,21 @@ async def create_paddle_checkout(data: CheckoutRequest, current_user_email: Opti
                     "custom_data": {"email": user_email, "package_type": data.package_type}
                 }
             )
+            
             if paddle_response.status_code in [200, 201]:
-                checkout_url = paddle_response.json().get("data", {}).get("checkout", {}).get("url")
+                res_data = paddle_response.json()
+                # সেফ চেকআউট ইউআরএল এক্সট্রাকশন (যাতে আগের 500 এরর না আসে)
+                checkout_url = (
+                    res_data.get("data", {}).get("url") or 
+                    res_data.get("data", {}).get("checkout", {}).get("url")
+                )
+                
+                if not checkout_url:
+                    raise HTTPException(status_code=400, detail=f"Checkout URL not found in Paddle response: {res_data}")
+                    
                 return {"status": "success", "checkout_url": checkout_url}
             else:
-                raise HTTPException(status_code=400, detail=paddle_response.text)
+                raise HTTPException(status_code=400, detail=f"Paddle API Error: {paddle_response.text}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
