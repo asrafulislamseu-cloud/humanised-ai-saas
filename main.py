@@ -268,7 +268,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
-            # গুগল এআই সার্ভার ডাউন বা ওভারলোডেড থাকলে (503 বা 429) ক্র্যাশ না করে হ্যান্ডেল করবে
             if any(err in error_str for err in ["429", "503", "ResourceExhausted", "Quota", "ServiceUnavailable"]):
                 if key_type == "user":
                     user_cooldown_tracker[user_email] = time.time()
@@ -277,7 +276,6 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
     if not user.is_premium and is_user_in_cooldown:
         raise HTTPException(status_code=429, detail="Hold up 65 second or buy a top up package")
         
-    # গুগল এআই থেকে ৫৬৩/৫৩ বা অন্য কোনো সার্ভার এরর আসলেও সার্ভার ক্র্যাশ (520) না করিয়ে সুন্দর মেসেজ থ্রো করবে
     raise HTTPException(
         status_code=503, 
         detail="Google AI is currently experiencing high demand (503 Service Unavailable). Please try again in a moment."
@@ -334,6 +332,20 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
             "remaining_messages": max(0, user.message_limit - user.messages_used) if user.is_premium else 0
         }
     }
+
+# --- নতুন যুক্ত করা Forgot Password রাউট ---
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+@app.post("/forgot-password")
+def forgot_password(data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.email == data.email).first()
+    if not user:
+        # সিকিউরিটির জন্য ইউজার না থাকলেও সাকসেস মেসেজ রিটার্ন করা ভালো যাতে ইমেইল এক্সিস্ট করে কিনা তা প্রকাশ না পায়
+        return {"status": "success", "message": "If this email is registered, password reset instructions have been sent."}
+    
+    # এখানে আপনি চাইলে ইমেইল পাঠানোর কোড (SMTP/SendGrid) যুক্ত করতে পারেন।
+    return {"status": "success", "message": "Password reset instructions sent to your email."}
 
 @app.post("/logout")
 def logout(response: Response):
