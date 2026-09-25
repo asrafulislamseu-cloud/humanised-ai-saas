@@ -112,10 +112,11 @@ master_key_cycle = itertools.cycle(MASTER_API_KEYS) if MASTER_API_KEYS else None
 user_cooldown_tracker: Dict[str, float] = {}
 COOLDOWN_DURATION = 65.0  
 
+# সার্ভারের অতিরিক্ত চাপ এড়ানোর জন্য কিউ/কনকারেন্সি লিমিট (Semaphore)
 MAX_CONCURRENT_AI_CALLS = 20
 ai_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AI_CALLS)
 
-app = FastAPI(title="Humanised AI SaaS Platform with Multi-Account Support", version="14.6", lifespan=lifespan)
+app = FastAPI(title="Humanised AI SaaS Platform with Multi-Account Support", version="14.8", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -190,7 +191,7 @@ class LanguageEnum(str, Enum):
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Platform is running with Multi-Account & Gemini 3.6 Flash Support!"}
+    return {"message": "AI Platform is running smoothly with Gemini 3.6 Flash Support!"}
 
 async def generate_voice_from_edge(text_to_speak: str, lang_code: str, persona_val: str) -> bytes:
     lang_dict = EDGE_VOICE_MAPPING.get(lang_code, EDGE_VOICE_MAPPING["bn"])
@@ -217,6 +218,7 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
     current_time = time.time()
     user_email = user.email
     
+    # ইউজার কুলডাউন চেক (৬৫ সেকেন্ড পার হলে স্বয়ংক্রিয়ভাবে মুছে যাবে)
     is_user_in_cooldown = False
     if user_email in user_cooldown_tracker:
         if current_time - user_cooldown_tracker[user_email] < COOLDOWN_DURATION:
@@ -226,15 +228,18 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
 
     keys_to_try = []
 
+    # ১. ইউজার কুলডাউনে না থাকলে নিজের কি দিয়ে চেষ্টা করবে
     if not is_user_in_cooldown and user.user_api_key:
         keys_to_try.append(("user", user.user_api_key))
     
+    # ২. প্রিমিয়াম ইউজার হলে এবং মাস্টার কি লিমিট থাকলে মাস্টার কি যোগ হবে
     if user.is_premium and MASTER_API_KEYS and user.messages_used < user.message_limit:
         for _ in range(min(3, len(MASTER_API_KEYS))):
             keys_to_try.append(("master", next(master_key_cycle)))
 
+    # ৩. ফ্রি ইউজার যদি কুলডাউনে থাকে, সাথে সাথে নির্দিষ্ট ম্যাসেজ দেখাবে
     if not user.is_premium and is_user_in_cooldown:
-        raise Exception("Please hold 65 seconds or buy a top up package")
+        raise Exception("Hold up 65 second or buy a top up package")
 
     last_exception = None
     
@@ -267,12 +272,19 @@ async def call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, 
         except Exception as e:
             error_str = str(e)
             last_exception = e
+            # নিজের কি দিয়ে রিকোয়েস্ট করার সময় জেমিনি লিমিট এরর (429 ইত্যাদি) খেলে কুলডাউন স্টার্ট হবে
             if key_type == "user":
                 if any(err in error_str for err in ["429", "ResourceExhausted", "Quota", "503", "ServiceUnavailable"]):
                     user_cooldown_tracker[user_email] = time.time()
             continue
 
-    raise last_exception
+    if not user.is_premium and is_user_in_cooldown:
+        raise Exception("Hold up 65 second or buy a top up package")
+        
+    if last_exception:
+        raise last_exception
+    else:
+        raise Exception("Failed to generate response from Gemini API.")
 
 class UserRegisterRequest(BaseModel):
     email: str
@@ -305,6 +317,15 @@ def register_or_login(data: UserRegisterRequest, response: Response, db: Session
             user.password = data.password.strip()
     
     db.commit()
+    
+    # কুকির মেয়াদ ৯৯ দিন করা হলো
+    response.set_cookie(
+        key="current_user_email",
+        value=user.email,
+        max_age=99 * 24 * 60 * 60, # ৯৯ দিন সেশন সেভ থাকবে
+        httponly=True,
+        samesite="lax"
+    )
     
     return {
         "status": "success", 
@@ -529,7 +550,6 @@ async def process_ai_request(
 
         contents.append({"role": "user", "parts": [{"text": prompt}]})
         
-        # এখানে সঠিক ফাংশন কল যুক্ত করা হয়েছে
         ai_response_text, key_used = await call_gemini_with_smart_fallback(user, contents, temp_val, max_tokens, is_stream=False)
         
         db.add(ChatHistoryDB(user_email=active_email, role="user", message=user_message))
